@@ -4,3 +4,34 @@
 
 # Personal Claude Code instructions (private, not shared)
 CLAUDE.local.md
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.coverage.*
+.cache/
+venv/
+env/
+
+# Node.js cache
+node_modules/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+.agent/
+.agent.toml
+.env
+.agent/.env
+.agent/run.log
+.agent/error.log
+.agent/debug.log
