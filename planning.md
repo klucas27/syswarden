@@ -40,7 +40,7 @@ Implement strictly in this order:
 - ✅ **Phase 5 — Metrics collection:** `metrics` (`memory.rs`, `cpu.rs`, `io.rs`), `MetricsSnapshot`.
 - ✅ **Phase 6 — PSI parsing:** `pressure` PSI parser, `PsiMetrics`.
 - ✅ **Phase 7 — Process analysis:** `processes`, `ProcessInfo`, flagging.
-- **Phase 8 — Service analysis:** `services`, `ServiceInfo` (read-only systemd).
+- ✅ **Phase 8 — Service analysis:** `services`, `ServiceInfo` (read-only systemd).
 - **Phase 9 — Pressure model:** classification → `PressureSnapshot`, `PressureLevel`, system-state classification.
 - **Phase 10 — Profiles:** built-in `ProfileConfig`s, resolution.
 - **Phase 11 — Policy engine:** `policy`, decision tables → `PolicyDecision`.

@@ -15,6 +15,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "4", features = ["blocking"] }
 
 [lints.rust]
 unsafe_code = "warn"
