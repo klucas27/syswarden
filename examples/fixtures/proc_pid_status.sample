@@ -1,0 +1,16 @@
+Name:	test_proc
+Umask:	0022
+State:	S (sleeping)
+Tgid:	1234
+Ngid:	0
+Pid:	1234
+PPid:	1
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+VmPeak:	 204800 kB
+VmSize:	 204800 kB
+VmRSS:	 204800 kB
+VmSwap:	      0 kB
+Threads:	4
