@@ -32,11 +32,11 @@ If a requirement seems to conflict with `architecture.md`, stop and ask the huma
 
 Implement strictly in this order:
 
-- **Phase 0 — Repository skeleton:** directory tree, empty module files with `//!` docs, placeholder `main.rs`.
-- **Phase 1 — Cargo setup:** `Cargo.toml`, dependencies (only those marked Required for the current phase), workspace settings, lints.
-- **Phase 2 — Config model:** `config`, data contracts for config, TOML parse + validation, defaults.
-- **Phase 3 — CLI:** `clap` command tree, dispatch stubs, global flags, exit codes.
-- **Phase 4 — Logging:** `tracing` setup, `AuditEvent`, audit JSONL writer.
+- ✅ **Phase 0 — Repository skeleton:** directory tree, empty module files with `//!` docs, placeholder `main.rs`.
+- ✅ **Phase 1 — Cargo setup:** `Cargo.toml`, dependencies (only those marked Required for the current phase), workspace settings, lints.
+- ✅ **Phase 2 — Config model:** `config`, data contracts for config, TOML parse + validation, defaults.
+- ✅ **Phase 3 — CLI:** `clap` command tree, dispatch stubs, global flags, exit codes.
+- ✅ **Phase 4 — Logging:** `tracing` setup, `AuditEvent`, audit JSONL writer.
 - **Phase 5 — Metrics collection:** `metrics` (`memory.rs`, `cpu.rs`, `io.rs`), `MetricsSnapshot`.
 - **Phase 6 — PSI parsing:** `pressure` PSI parser, `PsiMetrics`.
 - **Phase 7 — Process analysis:** `processes`, `ProcessInfo`, flagging.

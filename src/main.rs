@@ -40,5 +40,7 @@ fn main() -> ExitCode {
         }
     };
 
+    logging::init(&config.global.log_level, parsed.verbose);
+
     cli::dispatch(&parsed, &config)
 }
