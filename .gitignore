@@ -1,0 +1,6 @@
+
+# Brain Engine local data (do not commit)
+.brain/
+
+# Personal Claude Code instructions (private, not shared)
+CLAUDE.local.md

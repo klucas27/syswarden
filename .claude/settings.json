@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "in=$(cat); printf '%s' \"$in\" | grep -oE '\"file_path\"[[:space:]]*:[[:space:]]*\"[^\"]+\"' | grep -q '\\.rs\"$' && [ -f Cargo.toml ] && cargo fmt --all >/dev/null 2>&1 || true",
+            "statusMessage": "cargo fmt",
+            "type": "command"
+          }
+        ],
+        "matcher": "Write|Edit"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post_response.sh",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre_prompt.sh",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

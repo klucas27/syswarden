@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "project_name": "syswarden",
+  "embedding_provider": "local",
+  "include_globs": [
+    "**/*"
+  ],
+  "exclude_globs": [
+    "**/.git/**",
+    "**/.brain/**",
+    "brain.config.json",
+    "**/brain.config.json",
+    "**/node_modules/**",
+    "**/target/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.venv/**",
+    "**/*.lock",
+    "**/*.min.*",
+    "**/.env",
+    "**/.env.*",
+    "**/*.pem",
+    "**/*.key"
+  ],
+  "max_file_size_bytes": 1048576,
+  "chunk": {
+    "max_lines": 120,
+    "overlap_lines": 20
+  },
+  "output_style": "rich",
+  "locator": {
+    "enabled": true,
+    "max_targets": 5,
+    "inject_directive": true
+  },
+  "summaries": {
+    "enabled": true,
+    "use_llm": false,
+    "max_summary_tokens": 120
+  }
+}
