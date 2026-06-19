@@ -34,6 +34,8 @@ pub struct PsiMetrics {
 /// Parse the text content of a `/proc/pressure/{cpu,memory,io}` file into [`PsiMetrics`].
 ///
 /// Accepts files with just a `some` line (CPU) or both `some` and `full` (memory, io).
+///
+/// # Errors
 /// Returns `Err(SyswardenError::Parse)` if the `some` line is missing or malformed.
 pub fn parse_psi(content: &str) -> Result<PsiMetrics, SyswardenError> {
     let mut metrics = PsiMetrics::default();
@@ -66,6 +68,7 @@ pub fn parse_psi(content: &str) -> Result<PsiMetrics, SyswardenError> {
 
 /// Read and parse a PSI file at `path`.
 ///
+/// # Errors
 /// Returns `Err(SyswardenError::Io(_))` with `kind() == NotFound` when PSI is unavailable
 /// (kernel built without `CONFIG_PSI`). Callers match on this to degrade gracefully.
 pub fn read_psi(path: &Path) -> Result<PsiMetrics, SyswardenError> {
@@ -252,6 +255,7 @@ fn apply_hysteresis(raw: PressureLevel, trend: &[PressureLevel], ticks: u32) -> 
 ///
 /// `trend` is a slice of recent pressure levels (oldest first) used for hysteresis.
 /// Pass an empty slice on the first tick.
+#[must_use]
 pub fn compute(
     caps: &Capabilities,
     metrics: &MetricsSnapshot,
@@ -323,6 +327,7 @@ pub fn compute(
 /// (Phase 14) when pressure has been falling for N consecutive ticks. This function
 /// never returns `Recovery`, `Initializing`, or `ProtectedMode` — those are set
 /// externally by the caller.
+#[must_use]
 pub fn classify_state(
     pressure: &PressureSnapshot,
     processes: &[ProcessInfo],

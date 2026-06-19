@@ -28,6 +28,9 @@ pub struct MemoryMetrics {
 ///
 /// `swap_in_rate` and `swap_out_rate` are always 0.0 here; `collect()` fills them in
 /// from the vmstat delta after two samples.
+///
+/// # Errors
+/// Returns `Err` if required fields (`MemTotal`, `MemAvailable`) are missing.
 pub fn parse(content: &str) -> Result<MemoryMetrics, SyswardenError> {
     let mut map: HashMap<&str, u64> = HashMap::new();
     for line in content.lines() {
@@ -63,6 +66,9 @@ pub fn parse(content: &str) -> Result<MemoryMetrics, SyswardenError> {
 }
 
 /// Read and parse `/proc/meminfo` from `path`.
+///
+/// # Errors
+/// Returns `Err` on I/O failure or if required fields are missing.
 pub fn read(path: &Path) -> Result<MemoryMetrics, SyswardenError> {
     let content = std::fs::read_to_string(path)?;
     parse(&content)

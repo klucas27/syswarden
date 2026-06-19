@@ -77,6 +77,9 @@ pub struct CpuMetrics {
 /// Parse the aggregate `cpu` line from `/proc/stat` into a [`CpuSample`].
 ///
 /// Swap counters default to 0; call [`update_swap`] after to fill them in.
+///
+/// # Errors
+/// Returns `Err` if the `cpu` aggregate line is missing or unparseable.
 pub fn parse_stat(content: &str) -> Result<CpuSample, SyswardenError> {
     let line = content
         .lines()
@@ -142,6 +145,9 @@ pub fn count_cpus(stat_content: &str) -> u32 {
 }
 
 /// Parse `/proc/loadavg` content → `(load1, load5, load15)`.
+///
+/// # Errors
+/// Returns `Err` if any of the three load-average fields are missing or non-numeric.
 #[allow(clippy::similar_names)]
 pub fn parse_loadavg(content: &str) -> Result<(f64, f64, f64), SyswardenError> {
     let mut parts = content.split_whitespace();

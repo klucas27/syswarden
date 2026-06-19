@@ -191,6 +191,7 @@ fn developer() -> ProfileConfig {
 // ---------------------------------------------------------------------------
 
 /// All supported profile names, in declaration order.
+#[must_use]
 pub fn all() -> &'static [ProfileName] {
     &[
         ProfileName::Conservative,

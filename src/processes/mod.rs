@@ -37,6 +37,9 @@ pub struct ProcessInfo {
 /// Parse `/proc/{pid}/stat` content → `(total_cpu_ticks, nice)`.
 ///
 /// Uses `rfind(')')` to handle process names that contain spaces or parentheses.
+///
+/// # Errors
+/// Returns `Err` if the format is unrecognized or required fields are missing.
 pub fn parse_pid_stat(content: &str) -> Result<(u64, i32), SyswardenError> {
     let after_comm = content
         .rfind(')')
@@ -65,6 +68,9 @@ pub fn parse_pid_stat(content: &str) -> Result<(u64, i32), SyswardenError> {
 }
 
 /// Extract `VmRSS` (in kB) from `/proc/{pid}/status` content.
+///
+/// # Errors
+/// Returns `Err` if the `VmRSS:` field is missing or non-numeric.
 pub fn parse_rss_kb(status_content: &str) -> Result<u64, SyswardenError> {
     status_content
         .lines()
@@ -76,6 +82,9 @@ pub fn parse_rss_kb(status_content: &str) -> Result<u64, SyswardenError> {
 }
 
 /// Parse uptime in seconds from `/proc/uptime` content.
+///
+/// # Errors
+/// Returns `Err` if the file is empty or the first field is non-numeric.
 pub fn parse_uptime(content: &str) -> Result<f64, SyswardenError> {
     content
         .split_whitespace()
@@ -86,6 +95,7 @@ pub fn parse_uptime(content: &str) -> Result<f64, SyswardenError> {
 }
 
 /// Compute lifetime-average CPU% from cumulative tick count and system uptime.
+#[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn cpu_pct_from_ticks(total_ticks: u64, uptime_secs: f64) -> f64 {
     if uptime_secs < 0.001 {
@@ -182,6 +192,7 @@ fn list_pids() -> Vec<u32> {
 /// Processes whose `/proc` entry disappears mid-scan are silently skipped —
 /// this is normal for short-lived processes and is not an error.
 /// Never signals, kills, re-nices, or otherwise modifies any process.
+#[must_use]
 pub fn analyze(config: &AppConfig) -> Vec<ProcessInfo> {
     let uptime_secs = std::fs::read_to_string("/proc/uptime")
         .ok()

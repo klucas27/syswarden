@@ -1,1 +1,51 @@
-# Hardened systemd unit — filled in Phase 17 (architecture.md §18).
+# syswarden — system supervision daemon
+# Hardened unit per architecture.md §18.
+#
+# Manual install:
+#   sudo install -Dm644 packaging/systemd/syswarden.service \
+#                       /etc/systemd/system/syswarden.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now syswarden
+#
+# Manual uninstall:
+#   sudo systemctl disable --now syswarden
+#   sudo rm /etc/systemd/system/syswarden.service
+#   sudo systemctl daemon-reload
+#
+# Logs:
+#   journalctl -u syswarden -f
+
+[Unit]
+Description=syswarden system supervision daemon
+Documentation=https://github.com/kresley/syswarden
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/syswarden daemon
+Restart=on-failure
+RestartSec=5
+
+# State directories — created automatically by systemd (mode 0750, owned by root).
+StateDirectory=syswarden
+LogsDirectory=syswarden
+
+# Hardening (architecture.md §18)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+# cgroup access is required to read/govern resource control — must not restrict.
+ProtectControlGroups=no
+# D-Bus only; no network sockets of any kind.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=yes
+# State files (history, audit, rollback) live here.
+ReadWritePaths=/var/lib/syswarden
+
+[Install]
+WantedBy=multi-user.target

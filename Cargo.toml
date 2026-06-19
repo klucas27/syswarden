@@ -17,6 +17,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = { version = "4", features = ["blocking"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints.rust]
 unsafe_code = "warn"
 

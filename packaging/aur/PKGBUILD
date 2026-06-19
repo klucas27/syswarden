@@ -1,1 +1,43 @@
-# AUR PKGBUILD — filled in Phase 19.
+# Maintainer: Kresley <kresleylucas.r@gmail.com>
+pkgname=syswarden
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Local, low-overhead Rust system supervision daemon for Arch Linux"
+arch=('x86_64' 'aarch64')
+url="https://github.com/kresley/syswarden"
+license=('MIT')
+depends=('systemd')
+makedepends=('rust' 'cargo')
+backup=('etc/syswarden/config.toml')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    cargo build --release --locked 2>&1
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    cargo test --release --locked 2>&1
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    # Binary
+    install -Dm755 "target/release/$pkgname" \
+        "$pkgdir/usr/bin/$pkgname"
+
+    # systemd unit
+    install -Dm644 "packaging/systemd/$pkgname.service" \
+        "$pkgdir/usr/lib/systemd/system/$pkgname.service"
+
+    # Example config (not overwriting user edits on upgrade via backup=)
+    install -Dm644 "examples/config.balanced.toml" \
+        "$pkgdir/etc/syswarden/config.toml.example"
+
+    # License
+    install -Dm644 LICENSE \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

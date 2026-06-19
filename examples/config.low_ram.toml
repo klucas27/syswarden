@@ -1,1 +1,70 @@
-# Example low_ram profile config — filled in Phase 19.
+# syswarden — low-RAM / memory-constrained profile example
+#
+# Suitable for machines with 4 GB RAM or less, or for a VPS where memory
+# is the dominant constraint. Lowers pressure thresholds so syswarden
+# reacts earlier; still dry-run by default.
+#
+# Copy to /etc/syswarden/config.toml and edit as needed.
+# Run `syswarden config validate` to check for issues.
+
+[global]
+profile = "conservative"
+dry_run = true                    # Set to false only after reviewing recommendations
+allow_aggressive_actions = false
+allow_zram_apply = false          # Set to true (with caution) to let syswarden manage zram
+allow_sysctl_apply = false
+log_level = "info"
+
+[polling]
+idle_interval_secs = 5
+pressure_interval_secs = 2
+min_interval_secs = 1
+max_interval_secs = 30
+hysteresis_ticks = 2              # React slightly faster on low-RAM systems
+
+[pressure.thresholds]
+# Lower thresholds — react earlier on a memory-constrained machine
+cpu_moderate = 10.0
+cpu_high     = 25.0
+cpu_critical = 50.0
+# Tighter memory thresholds
+mem_some_moderate  = 5.0
+mem_full_high      = 3.0
+mem_full_critical  = 10.0
+io_moderate = 10.0
+io_high     = 25.0
+io_critical = 50.0
+# Trigger at 15% MemAvailable (vs 10% default) for earlier warning
+mem_available_low_pct = 15.0
+
+[protected]
+processes = [
+    "systemd", "init", "kthreadd",
+    "syswarden",
+    "sshd", "dbus-daemon",
+]
+services = [
+    "syswarden.service",
+    "dbus.service",
+    "sshd.service",
+    "systemd-journald.service",
+    "systemd-logind.service",
+    "systemd-udevd.service",
+]
+
+[allowed]
+# Empty by default; add user-space services to permit resource governance.
+services = []
+
+[history]
+dir            = "/var/lib/syswarden/history"
+retention_days = 7      # Shorter retention on space-constrained system
+max_file_mb    = 8
+
+[logging]
+audit_dir = "/var/lib/syswarden/audit"
+journald  = true
+
+[rollback]
+dir          = "/var/lib/syswarden/rollback"
+keep_entries = 50       # Smaller cap on space-constrained system

@@ -40,6 +40,9 @@ pub struct MetricsSnapshot {
 /// `prev_cpu` is updated in-place so the next call computes accurate deltas.
 /// On the very first call (with a default/zeroed `prev_cpu`), CPU utilization
 /// reflects the since-boot average — accurate on subsequent calls.
+///
+/// # Errors
+/// Returns `Err` if reading `/proc/meminfo`, `/proc/stat`, or `/proc/loadavg` fails.
 #[allow(clippy::similar_names)]
 pub fn collect(
     _caps: &Capabilities,

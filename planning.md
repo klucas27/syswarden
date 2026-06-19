@@ -49,10 +49,10 @@ Implement strictly in this order:
 - ✅ **Phase 14 — Daemon loop:** `daemon`, full loop with dry-run only, signals, adaptive sleep.
 - ✅ **Phase 15 — Local history:** `history` JSONL, `HistoryRecord`, retention.
 - ✅ **Phase 16 — Rollback:** `rollback` metadata capture/list (revert scaffolding; real revert lands with real actions in later versions).
-- **Phase 17 — systemd integration:** `packaging/systemd/syswarden.service`, hardened, manual install docs.
-- **Phase 18 — Tests:** complete the test suite per §7.
-- **Phase 19 — Packaging:** AUR `PKGBUILD`, examples.
-- **Phase 20 — Documentation:** `README.md`, `docs/usage.md`, finalize ADRs.
+- ✅ **Phase 17 — systemd integration:** `packaging/systemd/syswarden.service`, hardened, manual install docs.
+- ✅ **Phase 18 — Tests:** complete the test suite per §7.
+- ✅ **Phase 19 — Packaging:** AUR `PKGBUILD`, examples.
+- ✅ **Phase 20 — Documentation:** `README.md`, `docs/usage.md`, finalize ADRs.
 
 **Real state-changing action execution is NOT part of v0.1.** It begins in v0.2 only after Phases 12 (safety) and 16 (rollback) are complete and tested.
 
