@@ -37,7 +37,7 @@ Implement strictly in this order:
 - ✅ **Phase 2 — Config model:** `config`, data contracts for config, TOML parse + validation, defaults.
 - ✅ **Phase 3 — CLI:** `clap` command tree, dispatch stubs, global flags, exit codes.
 - ✅ **Phase 4 — Logging:** `tracing` setup, `AuditEvent`, audit JSONL writer.
-- **Phase 5 — Metrics collection:** `metrics` (`memory.rs`, `cpu.rs`, `io.rs`), `MetricsSnapshot`.
+- ✅ **Phase 5 — Metrics collection:** `metrics` (`memory.rs`, `cpu.rs`, `io.rs`), `MetricsSnapshot`.
 - **Phase 6 — PSI parsing:** `pressure` PSI parser, `PsiMetrics`.
 - **Phase 7 — Process analysis:** `processes`, `ProcessInfo`, flagging.
 - **Phase 8 — Service analysis:** `services`, `ServiceInfo` (read-only systemd).
