@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use crate::config::AppConfig;
+use crate::rollback::RollbackStore;
 
 // ---------------------------------------------------------------------------
 // Exit codes
@@ -203,12 +204,18 @@ pub fn parse() -> Cli {
 /// Phase 3: all handlers are stubs; business logic is not yet implemented.
 /// Returns an [`ExitCode`] for `main` to forward to the OS.
 #[must_use]
-pub fn dispatch(cli: &Cli, _config: &AppConfig) -> ExitCode {
+pub fn dispatch(cli: &Cli, config: &AppConfig) -> ExitCode {
     match &cli.command {
         Command::Status => run_stub("status"),
         Command::Analyze => run_stub("analyze"),
         Command::Doctor => run_stub("doctor"),
-        Command::Daemon => run_stub("daemon"),
+        Command::Daemon => match crate::daemon::run(config.clone()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!("{e:#}");
+                ExitCode::from(exit_codes::RUNTIME_ERROR)
+            }
+        },
         Command::Logs { .. } => run_stub("logs"),
         Command::Explain => run_stub("explain"),
         Command::Pressure => run_stub("pressure"),
@@ -218,7 +225,7 @@ pub fn dispatch(cli: &Cli, _config: &AppConfig) -> ExitCode {
         Command::Config { cmd } => dispatch_config(cmd),
         Command::Actions { cmd } => dispatch_actions(cmd),
         Command::Zram { cmd } => dispatch_zram(cmd),
-        Command::Rollback { cmd } => dispatch_rollback(cmd),
+        Command::Rollback { cmd } => dispatch_rollback(cmd, config),
         Command::Report { .. } => run_stub("report"),
         Command::Version => {
             println!("syswarden {}", env!("CARGO_PKG_VERSION"));
@@ -265,10 +272,49 @@ fn dispatch_zram(cmd: &ZramCommand) -> ExitCode {
 }
 
 #[must_use]
-fn dispatch_rollback(cmd: &RollbackCommand) -> ExitCode {
+fn dispatch_rollback(cmd: &RollbackCommand, config: &AppConfig) -> ExitCode {
     match cmd {
-        RollbackCommand::List => run_stub("rollback list"),
-        RollbackCommand::Apply { .. } => run_stub("rollback apply"),
+        RollbackCommand::List => {
+            let store = match RollbackStore::open(config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("rollback: cannot open store: {e:#}");
+                    return ExitCode::from(exit_codes::RUNTIME_ERROR);
+                }
+            };
+            let entries = store.list();
+            if entries.is_empty() {
+                println!("No rollback entries.");
+            } else {
+                for e in entries {
+                    println!(
+                        "id={} ts={} kind={} target={} reversible={}",
+                        e.id,
+                        e.timestamp.format("%Y-%m-%dT%H:%M:%SZ"),
+                        e.action_kind,
+                        e.target,
+                        e.reversible,
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        RollbackCommand::Apply { id } => {
+            let store = match RollbackStore::open(config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("rollback: cannot open store: {e:#}");
+                    return ExitCode::from(exit_codes::RUNTIME_ERROR);
+                }
+            };
+            match store.apply(*id) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("rollback apply: {e:#}");
+                    ExitCode::from(exit_codes::RUNTIME_ERROR)
+                }
+            }
+        }
     }
 }
 
@@ -594,7 +640,12 @@ mod tests {
 
     #[test]
     fn stub_commands_exit_success() {
-        let cfg = crate::config::defaults();
+        let mut cfg = crate::config::defaults();
+        // Override dirs that require root so the test runs without privileges.
+        cfg.rollback.dir = std::env::temp_dir()
+            .join("syswarden_cli_stub_rollback")
+            .to_string_lossy()
+            .to_string();
         let cases: &[&[&str]] = &[
             &["syswarden", "status"],
             &["syswarden", "analyze"],

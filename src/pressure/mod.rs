@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 use crate::error::SyswardenError;
@@ -100,7 +101,7 @@ fn get_u64(kv: &std::collections::HashMap<&str, &str>, key: &str) -> Result<u64,
 ///
 /// Declaration order defines `Ord`: `None < Low < Moderate < High < Critical`.
 /// Use `.max()` to combine sub-levels from CPU/memory/IO.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum PressureLevel {
     #[default]
     None,
