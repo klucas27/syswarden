@@ -43,7 +43,7 @@ Implement strictly in this order:
 - ✅ **Phase 8 — Service analysis:** `services`, `ServiceInfo` (read-only systemd).
 - ✅ **Phase 9 — Pressure model:** classification → `PressureSnapshot`, `PressureLevel`, system-state classification.
 - ✅ **Phase 10 — Profiles:** built-in `ProfileConfig`s, resolution.
-- **Phase 11 — Policy engine:** `policy`, decision tables → `PolicyDecision`.
+- ✅ **Phase 11 — Policy engine:** `policy`, decision tables → `PolicyDecision`.
 - **Phase 12 — Safety layer:** `safety`, gates, `SafetyDecision` (fail-closed).
 - **Phase 13 — Dry-run actions:** `actions` planner + simulator, `PlannedAction`/`ActionResult`. **No real execution yet.**
 - **Phase 14 — Daemon loop:** `daemon`, full loop with dry-run only, signals, adaptive sleep.
