@@ -350,3 +350,79 @@ Run `syswarden config validate` and fix each issue listed. The most common:
 Unlikely, but if it happens: increase `idle_interval_secs` and
 `min_interval_secs`. The daemon is designed to be lighter than the problems
 it solves.
+
+---
+
+## Aggressive opt-in (v0.3+)
+
+By default syswarden makes **zero system changes** — `dry_run = true` is the
+master switch. The aggressive actions below are layered opt-ins: each layer
+must be explicitly enabled.
+
+### What counts as "aggressive"
+
+| Action | Requires |
+|---|---|
+| `MemoryMax` (cgroup hard cap) | `allow_aggressive_actions = true` + `Aggressive`-risk profile + allowlisted service |
+| `RestartService` / `StopService` | same as above |
+| `sysctl` apply | same as above **plus** `allow_sysctl_apply = true` |
+
+### Minimal opt-in config snippet
+
+```toml
+[global]
+dry_run = false
+allow_aggressive_actions = true
+# For sysctl only:
+# allow_sysctl_apply = true
+
+[global]
+profile = "performance"   # or any custom profile with max_allowed_risk = "Aggressive"
+
+[allowed]
+services = [
+    "myapp.service",
+    "another.service",
+]
+```
+
+> `conservative` and `balanced` profiles **never** allow Aggressive-risk actions,
+> regardless of `allow_aggressive_actions`. Use `performance` or a custom profile.
+
+### MemoryMax escalation gate
+
+`MemoryMax` is only applied after `MemoryHigh` has already been applied to the
+target service. syswarden reads the live cgroup and blocks `MemoryMax` if
+`memory.high` is not yet set. This prevents hard-capping a service that has
+never been soft-capped first.
+
+### sysctl apply
+
+Enable with **both** flags:
+
+```toml
+[global]
+allow_aggressive_actions = true
+allow_sysctl_apply = true
+```
+
+Keys are written directly to `/proc/sys/<key>` (dots converted to slashes).
+No shell, no `sysctl` binary. The prior value is captured and stored in the
+rollback log before every write. Restore with:
+
+```sh
+syswarden rollback list
+syswarden rollback apply <id>
+```
+
+### Confirming zero changes under defaults
+
+Run with the default config (or without a config file):
+
+```sh
+syswarden actions dry-run
+```
+
+Every line should read `[DRY-RUN]`. The default config ships with
+`dry_run = true`, empty `allowed.services`, `allow_aggressive_actions = false`,
+and `allow_sysctl_apply = false` — no service is reachable for modification.
