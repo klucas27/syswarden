@@ -879,6 +879,7 @@ fn dispatch_config(cmd: &ConfigCommand, config: &AppConfig, json: bool) -> ExitC
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)] // two exhaustive subcommand branches, each legitimately long
 fn dispatch_actions(cmd: &ActionsCommand, cli: &Cli, config: &AppConfig) -> ExitCode {
     match cmd {
         ActionsCommand::DryRun => {
@@ -940,7 +941,79 @@ fn dispatch_actions(cmd: &ActionsCommand, cli: &Cli, config: &AppConfig) -> Exit
 
             ExitCode::SUCCESS
         }
-        ActionsCommand::Apply => run_stub("actions apply"),
+        ActionsCommand::Apply => {
+            // Phase 27: real execution path (architecture.md §6 Allow branch).
+            let caps = Capabilities::detect();
+            let mcaps = to_metrics_caps(&caps);
+            let metrics_snap = collect_metrics!(&mcaps);
+
+            let profile_name = &config.global.profile;
+            let profile = profiles::resolve(profile_name, config);
+            let pressure_snap = pressure::compute(&mcaps, &metrics_snap, config, &[]);
+            let procs = processes::analyze(config);
+            let svcs = services::analyze(config);
+            let state = pressure::classify_state(&pressure_snap, &procs, &svcs, &mcaps);
+            let decision = policy::decide(state, &profile, &procs, &svcs);
+            let planned = actions::plan(&decision, &profile, &procs);
+
+            let mut rollback = match RollbackStore::open(config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot open rollback store: {e:#}");
+                    return ExitCode::from(exit_codes::RUNTIME_ERROR);
+                }
+            };
+
+            let results: Vec<_> = planned
+                .iter()
+                .map(|a| actions::execute(a, config, &profile, &caps, &mut rollback))
+                .collect();
+
+            if cli.json {
+                let json = serde_json::json!({
+                    "state": format!("{state:?}"),
+                    "intent": format!("{:?}", decision.intent),
+                    "rationale": decision.rationale,
+                    "actions": results.iter().zip(planned.iter()).map(|(r, a)| serde_json::json!({
+                        "id": r.action_id,
+                        "kind": format!("{:?}", a.kind),
+                        "risk": format!("{:?}", a.risk),
+                        "target": format!("{:?}", a.target),
+                        "status": format!("{:?}", r.status),
+                        "message": r.message,
+                        "rollback_id": r.rollback_id,
+                    })).collect::<Vec<_>>(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json).unwrap_or_default()
+                );
+                return ExitCode::SUCCESS;
+            }
+
+            println!("State:   {state:?}");
+            println!("Policy:  {:?}", decision.intent);
+            println!("         \"{}\"", decision.rationale);
+            println!();
+            if results.is_empty() {
+                println!("Actions: none");
+            } else {
+                println!("Actions: {} executed:", results.len());
+                for (r, a) in results.iter().zip(planned.iter()) {
+                    println!(
+                        "  [{}]  {:?}  risk={:?}  target={:?}",
+                        r.action_id, a.kind, a.risk, a.target
+                    );
+                    println!("       Status: {:?}", r.status);
+                    println!("       {}", r.message);
+                    if let Some(rb) = r.rollback_id {
+                        println!("       rollback_id={rb}");
+                    }
+                }
+            }
+
+            ExitCode::SUCCESS
+        }
     }
 }
 

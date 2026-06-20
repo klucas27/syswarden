@@ -1,13 +1,22 @@
 //! Action planner, simulator, and (v0.2+) executor; every path gates through `safety` (architecture.md §5.12, §10).
 #![allow(dead_code)]
+// ioprio_get/ioprio_set and setpriority have no safe nix 0.29 wrapper — unsafe blocks are
+// the only option. See planning.md §4 ("allow only in `actions` with justification").
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::cgroups;
 use crate::config::AppConfig;
 use crate::policy::{DecisionIntent, PolicyDecision, Target};
 use crate::processes::ProcessInfo;
 use crate::profiles::{ActionRisk, ProfileConfig};
+use crate::rollback::{RollbackEntry, RollbackStore};
 use crate::safety::{self, Capabilities, SafetyDecision};
+use crate::systemd::{self, UnitProps};
 
 // ---------------------------------------------------------------------------
 // ActionKind
@@ -289,6 +298,208 @@ pub fn simulate(
 }
 
 // ---------------------------------------------------------------------------
+// Process prior-state capture (Phase 24, architecture.md §5.15)
+// ---------------------------------------------------------------------------
+
+/// Scheduler state for a process, captured before a priority change.
+///
+/// Serializable so it can be stored in `RollbackEntry.prior_state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessPriorState {
+    pub pid: u32,
+    /// Nice value [-20, 19] at capture time. `None` if `/proc` unreadable.
+    pub nice: Option<i32>,
+    /// Raw ioprio value (kernel encoding: `(class << 13) | level`). `None` if syscall fails.
+    pub ioprio: Option<i32>,
+}
+
+/// Capture scheduler state for `pid` from `/proc/{pid}/stat` and `ioprio_get(2)`.
+///
+/// Individual field failures produce `None` rather than propagating — the caller can
+/// decide whether a partial capture is acceptable.
+///
+/// # Errors
+/// Never returns `Err` — always returns a (possibly partial) `ProcessPriorState`.
+pub fn capture_process_prior_state(pid: u32) -> Result<ProcessPriorState> {
+    let nice = read_nice_from_proc(pid).ok();
+    // SAFETY: sys_ioprio_get is a read-only kernel syscall; no kernel state is mutated.
+    let ioprio = unsafe { sys_ioprio_get(pid) }.ok();
+    Ok(ProcessPriorState { pid, nice, ioprio })
+}
+
+// ---------------------------------------------------------------------------
+// Process executors (Phase 24)
+// ---------------------------------------------------------------------------
+
+/// Set the nice value for a process (architecture.md §5.12).
+///
+/// Defense-in-depth: refuses `pid ≤ 1` even if the safety gate passed it
+/// (architecture.md §17.3).
+///
+/// # Errors
+/// Missing/invalid `nice` param; pid is protected; `setpriority(2)` fails.
+pub fn apply_nice(action: &PlannedAction) -> Result<ActionResult> {
+    let pid = get_process_pid(action)?;
+
+    // Defense-in-depth re-check (architecture.md §17.3): pid 0 = kernel, 1 = init.
+    if pid <= 1 {
+        return Ok(ActionResult {
+            action_id: action.id,
+            status: ActionStatus::Blocked,
+            message: format!("apply_nice: pid={pid} is protected (init/kernel)"),
+            rollback_id: None,
+        });
+    }
+
+    let nice_val: i32 = action
+        .params
+        .get("nice")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("apply_nice: missing or invalid 'nice' param"))?;
+
+    if !(-20..=19).contains(&nice_val) {
+        anyhow::bail!("apply_nice: nice={nice_val} out of range [-20, 19]");
+    }
+
+    apply_nice_syscall(pid, nice_val)
+        .with_context(|| format!("apply_nice: setpriority(pid={pid}, nice={nice_val})"))?;
+
+    Ok(ActionResult {
+        action_id: action.id,
+        status: ActionStatus::Executed,
+        message: format!("set nice={nice_val} for pid={pid}"),
+        rollback_id: None,
+    })
+}
+
+/// Set the ioprio for a process (architecture.md §5.12).
+///
+/// Defense-in-depth: refuses `pid ≤ 1` even if the safety gate passed it.
+///
+/// # Errors
+/// Invalid params; pid is protected; `ioprio_set(2)` fails.
+pub fn apply_ionice(action: &PlannedAction) -> Result<ActionResult> {
+    let pid = get_process_pid(action)?;
+
+    // Defense-in-depth re-check (architecture.md §17.3).
+    if pid <= 1 {
+        return Ok(ActionResult {
+            action_id: action.id,
+            status: ActionStatus::Blocked,
+            message: format!("apply_ionice: pid={pid} is protected (init/kernel)"),
+            rollback_id: None,
+        });
+    }
+
+    let class = parse_ioprio_class(
+        action
+            .params
+            .get("class")
+            .map_or("best-effort", String::as_str),
+    )?;
+    let level: u32 = action
+        .params
+        .get("level")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+
+    if level > 7 {
+        anyhow::bail!("apply_ionice: level={level} out of range [0, 7]");
+    }
+
+    // SAFETY: sys_ioprio_set is a standard Linux syscall; arguments are validated above.
+    unsafe { sys_ioprio_set(pid, class, level) }.with_context(|| {
+        format!("apply_ionice: ioprio_set(pid={pid}, class={class}, level={level})")
+    })?;
+
+    Ok(ActionResult {
+        action_id: action.id,
+        status: ActionStatus::Executed,
+        message: format!("set ioprio class={class} level={level} for pid={pid}"),
+        rollback_id: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Service executor (Phase 25)
+// ---------------------------------------------------------------------------
+
+// apply_service_props_with_prior is called from dispatch_with_prior, not exposed directly.
+
+// ---------------------------------------------------------------------------
+// Executor (Phase 27, architecture.md §6)
+// ---------------------------------------------------------------------------
+
+/// Execute `action` after gating through `safety::evaluate` (architecture.md §6).
+///
+/// This is the **real execution path** for v0.2+. Flow:
+/// 1. Gate — `safety::evaluate` → Block or `RequireDryRun` short-circuits.
+/// 2. Capture prior state + dispatch action.
+/// 3. On success, record a `RollbackEntry` with captured prior state.
+///
+/// Every code path that can mutate system state must go through this function.
+/// Direct calls to `apply_nice` / `apply_ionice` etc. bypass the safety gate and
+/// are only valid inside `dispatch_with_prior`.
+#[must_use]
+pub fn execute(
+    action: &PlannedAction,
+    config: &AppConfig,
+    profile: &ProfileConfig,
+    caps: &Capabilities,
+    rollback: &mut RollbackStore,
+) -> ActionResult {
+    match safety::evaluate(action, config, profile, caps) {
+        SafetyDecision::Block { reason } => {
+            return ActionResult {
+                action_id: action.id,
+                status: ActionStatus::Blocked,
+                message: reason,
+                rollback_id: None,
+            };
+        }
+        SafetyDecision::RequireDryRun => {
+            return ActionResult {
+                action_id: action.id,
+                status: ActionStatus::Simulated,
+                message: format!(
+                    "[DRY-RUN] {:?} on {:?} — {}",
+                    action.kind, action.target, action.explanation
+                ),
+                rollback_id: None,
+            };
+        }
+        SafetyDecision::Allow => {}
+    }
+
+    match dispatch_with_prior(action, config) {
+        Err(e) => ActionResult {
+            action_id: action.id,
+            status: ActionStatus::Failed,
+            message: format!("execute: {e:#}"),
+            rollback_id: None,
+        },
+        Ok((result, prior_state, reversible)) => {
+            if result.status == ActionStatus::Executed && reversible {
+                let entry = RollbackEntry::new(
+                    &format!("{:?}", action.kind),
+                    &format_target(&action.target),
+                    true,
+                )
+                .with_prior_state(prior_state);
+                let rb_id = entry.id;
+                rollback.record(entry);
+                ActionResult {
+                    rollback_id: Some(rb_id),
+                    ..result
+                }
+            } else {
+                result
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
 
@@ -323,6 +534,252 @@ fn policy_target_to_action_target(target: &Target, processes: &[ProcessInfo]) ->
         },
         Target::Service(unit) => ActionTarget::Service { unit: unit.clone() },
         Target::System => ActionTarget::System,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 24+25+27 private helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the pid from a Process-targeted action, or return Err.
+fn get_process_pid(action: &PlannedAction) -> Result<u32> {
+    match &action.target {
+        ActionTarget::Process { pid, .. } => Ok(*pid),
+        _ => anyhow::bail!("expected Process target, got {:?}", action.target),
+    }
+}
+
+/// Extract the unit name from a Service-targeted action, or return Err.
+fn get_service_unit(action: &PlannedAction) -> Result<String> {
+    match &action.target {
+        ActionTarget::Service { unit } => Ok(unit.clone()),
+        _ => anyhow::bail!("expected Service target, got {:?}", action.target),
+    }
+}
+
+/// Format an `ActionTarget` as a string suitable for `RollbackEntry.target`.
+///
+/// The format is parsable by `rollback::apply` for revert:
+/// - Process → `"pid=<n> comm=<s>"`
+/// - Service → `"unit=<s>"`
+/// - System  → `"system"`
+fn format_target(target: &ActionTarget) -> String {
+    match target {
+        ActionTarget::Process { pid, comm } => format!("pid={pid} comm={comm}"),
+        ActionTarget::Service { unit } => format!("unit={unit}"),
+        ActionTarget::System => "system".to_string(),
+    }
+}
+
+/// Parse the ioprio class string into a kernel class number (0–3).
+fn parse_ioprio_class(class: &str) -> Result<u32> {
+    match class {
+        "none" | "0" => Ok(0),
+        "real-time" | "realtime" | "1" => Ok(1),
+        "best-effort" | "be" | "2" => Ok(2),
+        "idle" | "3" => Ok(3),
+        _ => anyhow::bail!("parse_ioprio_class: unknown class '{class}'"),
+    }
+}
+
+/// Read the current nice value for `pid` from `/proc/{pid}/stat`.
+///
+/// Parses field 19 (1-indexed) by splitting on the last `)` to handle comms
+/// that contain spaces or parentheses.
+fn read_nice_from_proc(pid: u32) -> Result<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .with_context(|| format!("read /proc/{pid}/stat"))?;
+    // Comm may contain spaces and '(' ')' characters; find the LAST ')'.
+    let after_comm = stat
+        .rfind(')')
+        .map(|i| stat[i + 1..].to_string())
+        .ok_or_else(|| anyhow::anyhow!("malformed /proc/{pid}/stat: no closing ')'"))?;
+    // Fields after comm: state(0) ppid(1) pgrp(2) session(3) tty(4) tpgid(5) flags(6)
+    // minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11) stime(12) cutime(13) cstime(14)
+    // priority(15) nice(16)
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    fields
+        .get(16)
+        .and_then(|s| s.parse::<i32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("cannot parse nice from /proc/{pid}/stat"))
+}
+
+/// Apply a nice value via `setpriority(2)`.
+fn apply_nice_syscall(pid: u32, nice: i32) -> Result<()> {
+    // SAFETY: setpriority is a standard POSIX syscall; pid and nice are validated by caller.
+    let ret = unsafe { nix::libc::setpriority(nix::libc::PRIO_PROCESS, pid, nice) };
+    if ret != 0 {
+        let e = std::io::Error::last_os_error();
+        anyhow::bail!("setpriority(pid={pid}, nice={nice}) failed: {e}");
+    }
+    Ok(())
+}
+
+/// Read the raw ioprio value for `pid` via `ioprio_get(2)`.
+///
+/// # Safety
+/// Caller must ensure pid is a valid process id.
+unsafe fn sys_ioprio_get(pid: u32) -> Result<i32> {
+    // IOPRIO_WHO_PROCESS = 1
+    let ret = nix::libc::syscall(nix::libc::SYS_ioprio_get, 1_i64, i64::from(pid));
+    if ret < 0 {
+        let e = std::io::Error::last_os_error();
+        anyhow::bail!("ioprio_get(pid={pid}) failed: {e}");
+    }
+    #[allow(clippy::cast_possible_truncation)] // ioprio fits in i32 by kernel contract
+    Ok(ret as i32)
+}
+
+/// Set the ioprio for `pid` via `ioprio_set(2)`.
+///
+/// Encoding: `(class << 13) | (level & 7)`.
+///
+/// # Safety
+/// Caller must validate class ∈ [0,3] and level ∈ [0,7].
+unsafe fn sys_ioprio_set(pid: u32, class: u32, level: u32) -> Result<()> {
+    let ioprio = i64::from((class << 13) | (level & 7));
+    // IOPRIO_WHO_PROCESS = 1
+    let ret = nix::libc::syscall(nix::libc::SYS_ioprio_set, 1_i64, i64::from(pid), ioprio);
+    if ret < 0 {
+        let e = std::io::Error::last_os_error();
+        anyhow::bail!("ioprio_set(pid={pid}, class={class}, level={level}) failed: {e}");
+    }
+    Ok(())
+}
+
+/// Build a `UnitProps` from a service-targeting `PlannedAction`.
+///
+/// For `SetMemoryHigh` with `limit = "auto"`, reads `memory.current` from the
+/// cgroup and applies an 80% cap. If the cgroup is unreadable, returns `Err`.
+fn build_unit_props_for_action(action: &PlannedAction) -> Result<UnitProps> {
+    match action.kind {
+        ActionKind::SetCpuWeight => {
+            let w: u64 = action
+                .params
+                .get("weight")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow::anyhow!("SetCpuWeight: missing 'weight' param"))?;
+            Ok(UnitProps {
+                cpu_weight: Some(w),
+                ..Default::default()
+            })
+        }
+        ActionKind::SetIoWeight => {
+            let w: u64 = action
+                .params
+                .get("weight")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow::anyhow!("SetIoWeight: missing 'weight' param"))?;
+            Ok(UnitProps {
+                io_weight: Some(w),
+                ..Default::default()
+            })
+        }
+        ActionKind::SetMemoryHigh => {
+            let unit = get_service_unit(action)?;
+            let s = action.params.get("limit").map_or("auto", String::as_str);
+            let memory_high = if s == "auto" {
+                let cg_path = cgroups::service_cgroup_path(&unit);
+                let reading = cgroups::read(&cg_path)
+                    .with_context(|| format!("SetMemoryHigh auto: read cgroup for {unit}"))?;
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation
+                )]
+                let cap = reading
+                    .memory_current
+                    .map(|cur| (cur as f64 * 0.8) as u64)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("SetMemoryHigh auto: memory.current unavailable for {unit}")
+                    })?;
+                Some(cap)
+            } else {
+                Some(
+                    s.parse::<u64>()
+                        .with_context(|| format!("SetMemoryHigh: invalid limit '{s}'"))?,
+                )
+            };
+            Ok(UnitProps {
+                memory_high,
+                ..Default::default()
+            })
+        }
+        _ => anyhow::bail!(
+            "build_unit_props_for_action: unsupported kind {:?}",
+            action.kind
+        ),
+    }
+}
+
+/// Dispatch an action, capture prior state, and return `(result, prior_state_json, reversible)`.
+///
+/// Called only after `safety::evaluate` returns `Allow`. Safe/informational actions are
+/// marked `reversible = false` (no rollback needed).
+fn dispatch_with_prior(
+    action: &PlannedAction,
+    config: &AppConfig,
+) -> Result<(ActionResult, serde_json::Value, bool)> {
+    match action.kind {
+        ActionKind::AdjustNice => {
+            let pid = get_process_pid(action)?;
+            let prior = capture_process_prior_state(pid)?;
+            let result = apply_nice(action)?;
+            let prior_json = serde_json::to_value(&prior).context("serialize ProcessPriorState")?;
+            Ok((result, prior_json, true))
+        }
+        ActionKind::AdjustIonice => {
+            let pid = get_process_pid(action)?;
+            let prior = capture_process_prior_state(pid)?;
+            let result = apply_ionice(action)?;
+            let prior_json = serde_json::to_value(&prior).context("serialize ProcessPriorState")?;
+            Ok((result, prior_json, true))
+        }
+        ActionKind::SetCpuWeight | ActionKind::SetIoWeight | ActionKind::SetMemoryHigh => {
+            let unit = get_service_unit(action)?;
+            // Defense-in-depth re-check (architecture.md §17.3)
+            if !config.allowed.services.contains(&unit) {
+                let result = ActionResult {
+                    action_id: action.id,
+                    status: ActionStatus::Blocked,
+                    message: format!("{unit} not in allowed.services"),
+                    rollback_id: None,
+                };
+                return Ok((result, serde_json::Value::Null, false));
+            }
+            let new_props = build_unit_props_for_action(action)?;
+            if new_props.is_empty() {
+                let result = ActionResult {
+                    action_id: action.id,
+                    status: ActionStatus::Blocked,
+                    message: "no properties to set (all fields None)".to_string(),
+                    rollback_id: None,
+                };
+                return Ok((result, serde_json::Value::Null, false));
+            }
+            // set_unit_properties captures prior state before writing (architecture.md §5.15)
+            let prior = systemd::set_unit_properties(&unit, &new_props, true)
+                .with_context(|| format!("SetUnitProperties for {unit}"))?;
+            let prior_json =
+                serde_json::to_value(&prior).context("serialize UnitProps prior state")?;
+            let result = ActionResult {
+                action_id: action.id,
+                status: ActionStatus::Executed,
+                message: format!("applied resource props to {unit}"),
+                rollback_id: None,
+            };
+            Ok((result, prior_json, true))
+        }
+        // Informational / safe actions — execute as no-ops, no rollback needed.
+        _ => {
+            let result = ActionResult {
+                action_id: action.id,
+                status: ActionStatus::Executed,
+                message: format!("{:?} completed (no system state changed)", action.kind),
+                rollback_id: None,
+            };
+            Ok((result, serde_json::Value::Null, false))
+        }
     }
 }
 
@@ -823,5 +1280,223 @@ mod tests {
                 action.kind
             );
         }
+    }
+
+    // --- Phase 24: parse_ioprio_class ---
+
+    #[test]
+    fn parse_ioprio_class_known_strings() {
+        assert_eq!(parse_ioprio_class("none").unwrap(), 0);
+        assert_eq!(parse_ioprio_class("real-time").unwrap(), 1);
+        assert_eq!(parse_ioprio_class("realtime").unwrap(), 1);
+        assert_eq!(parse_ioprio_class("best-effort").unwrap(), 2);
+        assert_eq!(parse_ioprio_class("be").unwrap(), 2);
+        assert_eq!(parse_ioprio_class("idle").unwrap(), 3);
+        assert_eq!(parse_ioprio_class("2").unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_ioprio_class_unknown_returns_err() {
+        assert!(parse_ioprio_class("garbage").is_err());
+        assert!(parse_ioprio_class("").is_err());
+    }
+
+    // --- Phase 24: read_nice_from_proc ---
+
+    #[test]
+    fn read_nice_from_current_process() {
+        let pid = std::process::id();
+        let nice = read_nice_from_proc(pid).expect("read nice");
+        assert!((-20..=19).contains(&nice), "nice={nice} out of valid range");
+    }
+
+    #[test]
+    fn read_nice_nonexistent_pid_returns_err() {
+        // PID 0 is the kernel swapper — /proc/0/stat does not exist.
+        assert!(read_nice_from_proc(0).is_err());
+    }
+
+    // --- Phase 24: capture_process_prior_state ---
+
+    #[test]
+    fn capture_prior_state_for_current_process() {
+        let pid = std::process::id();
+        let state = capture_process_prior_state(pid).expect("capture");
+        assert_eq!(state.pid, pid);
+        assert!(state.nice.is_some(), "nice should be readable for self");
+    }
+
+    // --- Phase 24: apply_nice defense-in-depth ---
+
+    #[test]
+    fn apply_nice_blocks_pid_one() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::AdjustNice,
+            risk: ActionRisk::Moderate,
+            target: ActionTarget::Process {
+                pid: 1,
+                comm: "systemd".into(),
+            },
+            params: {
+                let mut m = HashMap::new();
+                m.insert("nice".into(), "5".into());
+                m
+            },
+            explanation: "test".into(),
+        };
+        let result = apply_nice(&action).expect("should return Ok(Blocked)");
+        assert_eq!(result.status, ActionStatus::Blocked);
+    }
+
+    #[test]
+    fn apply_nice_rejects_nice_out_of_range() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::AdjustNice,
+            risk: ActionRisk::Moderate,
+            target: ActionTarget::Process {
+                pid: 999_999,
+                comm: "test".into(),
+            },
+            params: {
+                let mut m = HashMap::new();
+                m.insert("nice".into(), "20".into()); // out of range
+                m
+            },
+            explanation: "test".into(),
+        };
+        assert!(apply_nice(&action).is_err());
+    }
+
+    #[test]
+    fn apply_ionice_blocks_pid_zero() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::AdjustIonice,
+            risk: ActionRisk::Moderate,
+            target: ActionTarget::Process {
+                pid: 0,
+                comm: "kernel".into(),
+            },
+            params: HashMap::new(),
+            explanation: "test".into(),
+        };
+        let result = apply_ionice(&action).expect("should return Ok(Blocked)");
+        assert_eq!(result.status, ActionStatus::Blocked);
+    }
+
+    // --- Phase 25: build_unit_props_for_action ---
+
+    #[test]
+    fn build_unit_props_cpu_weight_parses_param() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::SetCpuWeight,
+            risk: ActionRisk::Moderate,
+            target: ActionTarget::Service {
+                unit: "test.service".into(),
+            },
+            params: {
+                let mut m = HashMap::new();
+                m.insert("weight".into(), "50".into());
+                m
+            },
+            explanation: "test".into(),
+        };
+        let props = build_unit_props_for_action(&action).unwrap();
+        assert_eq!(props.cpu_weight, Some(50));
+        assert!(props.io_weight.is_none());
+        assert!(props.memory_high.is_none());
+    }
+
+    #[test]
+    fn build_unit_props_io_weight_parses_param() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::SetIoWeight,
+            risk: ActionRisk::Moderate,
+            target: ActionTarget::Service {
+                unit: "test.service".into(),
+            },
+            params: {
+                let mut m = HashMap::new();
+                m.insert("weight".into(), "75".into());
+                m
+            },
+            explanation: "test".into(),
+        };
+        let props = build_unit_props_for_action(&action).unwrap();
+        assert!(props.cpu_weight.is_none());
+        assert_eq!(props.io_weight, Some(75));
+        assert!(props.memory_high.is_none());
+    }
+
+    #[test]
+    fn build_unit_props_memory_high_numeric_limit() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::SetMemoryHigh,
+            risk: ActionRisk::Moderate,
+            target: ActionTarget::Service {
+                unit: "test.service".into(),
+            },
+            params: {
+                let mut m = HashMap::new();
+                m.insert("limit".into(), "1073741824".into()); // 1 GiB
+                m
+            },
+            explanation: "test".into(),
+        };
+        let props = build_unit_props_for_action(&action).unwrap();
+        assert_eq!(props.memory_high, Some(1_073_741_824));
+    }
+
+    // --- Phase 25: dispatch_with_prior service defense ---
+
+    #[test]
+    fn dispatch_with_prior_blocks_unlisted_service() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::SetCpuWeight,
+            risk: ActionRisk::Moderate,
+            target: ActionTarget::Service {
+                unit: "unlisted.service".into(),
+            },
+            params: {
+                let mut m = HashMap::new();
+                m.insert("weight".into(), "50".into());
+                m
+            },
+            explanation: "test".into(),
+        };
+        let config = AppConfig::default(); // no services in allowed list
+        let (result, _, reversible) = dispatch_with_prior(&action, &config).unwrap();
+        assert_eq!(result.status, ActionStatus::Blocked);
+        assert!(!reversible);
+    }
+
+    // --- Phase 24: format_target ---
+
+    #[test]
+    fn format_target_process() {
+        let t = ActionTarget::Process {
+            pid: 42,
+            comm: "firefox".into(),
+        };
+        assert_eq!(format_target(&t), "pid=42 comm=firefox");
+    }
+
+    #[test]
+    fn format_target_service() {
+        let t = ActionTarget::Service {
+            unit: "foo.service".into(),
+        };
+        assert_eq!(format_target(&t), "unit=foo.service");
+    }
+
+    #[test]
+    fn format_target_system() {
+        assert_eq!(format_target(&ActionTarget::System), "system");
     }
 }

@@ -1,5 +1,7 @@
-//! Prior-state capture, rollback entry listing, and revert scaffolding (architecture.md §5.15).
+//! Prior-state capture, rollback entry listing, and revert (architecture.md §5.15).
 #![allow(dead_code)]
+// Process-priority revert uses setpriority(2) and ioprio_set(2) directly (nix 0.29 gap).
+#![allow(unsafe_code)]
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -130,15 +132,15 @@ impl RollbackStore {
         &self.entries
     }
 
-    /// Attempt to revert the action with `id`.
+    /// Revert the action recorded under `id` using its captured prior state.
     ///
-    /// In v0.1, all recorded entries are simulation scaffolding with no
-    /// captured prior state — revert is always refused with a clear message.
-    /// Real revert is implemented in v0.2+ when actual execution paths exist.
+    /// Dispatches based on `action_kind`:
+    /// - `AdjustNice`   → restore nice via `setpriority(2)`
+    /// - `AdjustIonice` → restore ioprio via `ioprio_set(2)`
+    /// - `SetCpuWeight | SetIoWeight | SetMemoryHigh` → restore via `systemd::set_unit_properties`
     ///
     /// # Errors
-    /// Returns `Err` if: the `id` is not found; the entry is irreversible;
-    /// or no real prior state was captured (v0.1 scaffolding).
+    /// `id` not found; entry irreversible; empty prior state; revert syscall/D-Bus failure.
     pub fn apply(&self, id: u64) -> Result<()> {
         let entry = self
             .entries
@@ -153,16 +155,25 @@ impl RollbackStore {
             );
         }
 
-        // An empty object indicates no real prior state was captured (v0.1 scaffolding).
+        // An empty object means no real prior state was captured (v0.1 simulation entries).
         if entry.prior_state == serde_json::Value::Object(serde_json::Map::default()) {
             bail!(
-                "rollback: entry id={id} ({}) has no captured prior state; \
-                 real revert requires v0.2+ execution paths",
+                "rollback: entry id={id} ({}) has no captured prior state",
                 entry.action_kind
             );
         }
 
-        bail!("rollback: revert of id={id} is not yet implemented (v0.2+)");
+        match entry.action_kind.as_str() {
+            "AdjustNice" => revert_nice(&entry.prior_state),
+            "AdjustIonice" => revert_ionice(&entry.prior_state),
+            "SetCpuWeight" | "SetIoWeight" | "SetMemoryHigh" => {
+                let unit = parse_unit_from_target(&entry.target).ok_or_else(|| {
+                    anyhow::anyhow!("rollback: cannot parse unit from target '{}'", entry.target)
+                })?;
+                revert_service_props(&unit, &entry.prior_state)
+            }
+            kind => bail!("rollback: no revert handler for action_kind '{kind}'"),
+        }
     }
 
     /// Total entry count (in-memory).
@@ -228,6 +239,70 @@ impl RollbackStore {
             warn!("rollback: cannot rewrite {:?}: {e}", self.file_path);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Private revert helpers (Phase 26)
+// ---------------------------------------------------------------------------
+
+/// Extract `"unit=foo.service"` → `"foo.service"` from a rollback target string.
+fn parse_unit_from_target(target: &str) -> Option<String> {
+    target.strip_prefix("unit=").map(String::from)
+}
+
+/// Restore the nice value for a process from `prior_state["pid"]` and `prior_state["nice"]`.
+fn revert_nice(prior_state: &serde_json::Value) -> Result<()> {
+    let pid = u32::try_from(
+        prior_state["pid"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("revert_nice: missing 'pid' in prior_state"))?,
+    )
+    .context("revert_nice: pid overflows u32")?;
+    #[allow(clippy::cast_possible_truncation)] // nice is always in [-20, 19]
+    let Some(nice) = prior_state["nice"].as_i64().map(|n| n as i32) else {
+        return Ok(()); // no prior nice captured → nothing to restore
+    };
+    // SAFETY: setpriority is a standard POSIX syscall; pid and nice are validated above.
+    let ret = unsafe { nix::libc::setpriority(nix::libc::PRIO_PROCESS, pid, nice) };
+    if ret != 0 {
+        let e = std::io::Error::last_os_error();
+        bail!("revert_nice: setpriority(pid={pid}, nice={nice}) failed: {e}");
+    }
+    Ok(())
+}
+
+/// Restore the ioprio for a process from `prior_state["pid"]` and `prior_state["ioprio"]`.
+fn revert_ionice(prior_state: &serde_json::Value) -> Result<()> {
+    let pid = u32::try_from(
+        prior_state["pid"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("revert_ionice: missing 'pid' in prior_state"))?,
+    )
+    .context("revert_ionice: pid overflows u32")?;
+    let Some(ioprio) = prior_state["ioprio"].as_i64() else {
+        return Ok(()); // no prior ioprio captured → nothing to restore
+    };
+    // IOPRIO_WHO_PROCESS = 1; re-set the raw previously-captured value.
+    // SAFETY: ioprio_set is a standard Linux syscall; ioprio value came from ioprio_get.
+    let ret =
+        unsafe { nix::libc::syscall(nix::libc::SYS_ioprio_set, 1_i64, i64::from(pid), ioprio) };
+    if ret < 0 {
+        let e = std::io::Error::last_os_error();
+        bail!("revert_ionice: ioprio_set(pid={pid}) failed: {e}");
+    }
+    Ok(())
+}
+
+/// Restore systemd unit properties from `prior_state` (a serialized `UnitProps`).
+fn revert_service_props(unit: &str, prior_state: &serde_json::Value) -> Result<()> {
+    let prior: crate::systemd::UnitProps = serde_json::from_value(prior_state.clone())
+        .context("rollback: deserialize UnitProps from prior_state")?;
+    if prior.is_empty() {
+        return Ok(()); // nothing was set before → nothing to restore
+    }
+    crate::systemd::set_unit_properties(unit, &prior, true)
+        .with_context(|| format!("rollback: restore properties for {unit}"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

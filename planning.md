@@ -517,3 +517,55 @@ Never violate this order:
 - **Keep all artifacts in English** — code, comments, docs, commits, logs, tests.
 
 Hand off after each phase with: a list of changed files, the checks run and their results, and the next phase to implement.
+
+---
+
+## 17. Version 0.2 Plan — Safe (Moderate) Actions
+
+> **Status:** v0.1 complete (Phases 0–20). This section is the v0.2 execution contract.
+> **Same rules apply:** follow `architecture.md`, do not change the architecture, implement strictly one phase at a time in order, report changed files, run the dev gate.
+
+### 17.1 Scope (architecture.md §23, §10 "Moderate actions")
+
+**In scope — real execution of *moderate* actions only:**
+- `nice` / `ionice` on non-protected processes.
+- `CPUWeight` / `IOWeight` / `MemoryHigh` on allowlisted services, applied as **transient** systemd runtime properties (auto-clear on reboot; architecture.md §18 "prefer transient runtime properties for temporary pressure response").
+- **Full rollback** (real prior-state capture + revert) for the above kinds.
+
+**Explicitly OUT of scope (later versions — do not implement):**
+- `MemoryMax`, service restart/stop (aggressive, §10) → v0.3.
+- `sysctl` apply (aggressive, §10) → v0.3.
+- Persistent systemd drop-ins under `/etc/systemd/system/<unit>.d/` → v0.3.
+- zram/zswap apply → v0.4.
+- Any new destructive capability — never.
+
+### 17.2 Invariants (no architecture drift)
+
+- No new config fields, enums, CLI commands, or profiles. `ActionKind::{AdjustNice, AdjustIonice, SetCpuWeight, SetIoWeight, SetMemoryHigh}` already exist (architecture.md §15); `actions apply` already exists (§13).
+- **"Enabling" requires no new flag.** A moderate action executes only when all align: `dry_run = false` **and** the active profile permits `Moderate` risk (`conservative` stays Safe-only; `balanced`+ permit Moderate, §11) **and** the target is non-protected / in `allowed.services`. `allow_aggressive_actions` remains irrelevant to v0.2.
+- Every execute path routes through `safety::evaluate` first; the §17 gate order is unchanged. Execution triggers **only** on `SafetyDecision::Allow`. `RequireDryRun` and `Block` keep simulating. Non-root → state-changing actions auto-blocked.
+- Safety defaults unchanged: `dry_run = true` default, protected sets intact, fail-closed.
+
+### 17.3 Phases (implement in order)
+
+- ✅ **Phase 21 — Cargo deps.** Add `zbus` (systemd D-Bus) and `nix` (priorities), both already specified in architecture.md §16. Minimal features. *Acceptance:* builds; no unused deps.
+- ✅ **Phase 22 — `cgroups` read layer (§5.9).** `detect() -> CgroupMode` (v2 detection) and `read(unit_path)` for current `CPUWeight`/`IOWeight`/`MemoryHigh`/usage. Read-only; writes never go direct. Fixture cgroup-tree tests. *Acceptance:* read-only; v2 detection correct; needed for prior-state capture and post-apply verification.
+- ✅ **Phase 23 — `systemd` write layer (§5.8).** zbus `read_unit_props(unit)` (Get current properties) and `set_unit_properties(unit, props, runtime = true)` via `SetUnitProperties`. Explicit typed calls only — no shell, no config-derived command strings (§17). Returns prior-state map for rollback. Mocked tests + one `#[ignore]` live test. *Acceptance:* transient-only writes; reads work; no shell interpolation.
+- ✅ **Phase 24 — process-priority executor (§5.12).** `nice` via `nix::setpriority`; `ionice` via `ioprio_set` (thin `unsafe` libc-syscall wrapper — `nix` lacks it — with a justifying comment; `unsafe` permitted only in `actions` per §16 lints). Capture prior nice/ioprio before changing. Re-check protected-pid at execute time (defense in depth). Tests at the syscall boundary. *Acceptance:* never touches protected processes; prior state captured.
+- ✅ **Phase 25 — service-resource executor (§5.12).** Map `SetCpuWeight`/`SetIoWeight`/`SetMemoryHigh` to transient systemd properties via Phase 23. Re-check allowlist at execute time. Capture prior properties for rollback. *Acceptance:* only allowlisted services modifiable; empty allowlist ⇒ nothing modifiable.
+- ✅ **Phase 26 — `rollback` real capture + revert (§5.15).** Replace the v0.1 `bail!` scaffolding in `rollback::apply`: `RollbackEntry.prior_state` now holds real captured JSON; `apply(id)` restores nice/ioprio (re-set) and service properties (re-set prior transient values). Refuse on missing/incompatible prior state or changed target; never panic. Round-trip + revert-each-kind tests. *Acceptance:* every reversible kind restores; irreversible/missing refuses cleanly.
+- ✅ **Phase 27 — wire executor into loop + CLI (§5.12, §6).** Implement `actions::execute(...)` as the §6 pseudocode `Allow` branch: `capture_prior_state` → execute → `rollback.record(...)`. Populate `ActionResult.rollback_id`. Wire `actions apply` and the daemon's `Allow` path (the daemon currently records nothing in v0.1). *Acceptance:* executes only after `safety::evaluate` returns `Allow`; dry-run path unchanged.
+- ✅ **Phase 28 — tests, docs, version.** Live `#[ignore]` integration tests (real `nice` on a throwaway process; real transient property on a dummy unit). Update `README.md`/`docs/usage.md` with the opt-in recipe (`dry_run = false` + a Moderate-permitting profile + populated `allowed.services`). Add an ADR for the transient-only choice. Bump version to `0.2.0`. Run the full dev gate. *Acceptance:* gate green; docs explain the opt-in; default config still makes zero system changes.
+
+### 17.4 Forbidden order (v0.2)
+
+- Do not implement any executor before `safety` and `rollback` real-revert exist (Phases 22–26 precede full wiring in 27).
+- Do not implement `MemoryMax` (it is aggressive and follows `MemoryHigh` in v0.3, not v0.2).
+- Do not implement persistent drop-ins, restart/stop, sysctl, or zram apply in v0.2.
+
+### 17.5 Definition of done (v0.2)
+
+- Phases 21–28 complete; dev gate green.
+- With `dry_run = true` (default): byte-for-byte identical behavior to v0.1 — zero system changes.
+- With opt-in (`dry_run = false` + Moderate profile + allowlist): moderate actions apply, are audited, and each is reversible via `rollback apply <id>`.
+- Protected sets, non-root blocking, and fail-closed defaults still hold; no prohibited or aggressive action is executable.
