@@ -7,8 +7,16 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::AppConfig;
+use crate::actions;
+use crate::config::{self, AppConfig};
+use crate::metrics::{self, CpuSample};
+use crate::policy;
+use crate::pressure;
+use crate::processes;
+use crate::profiles;
 use crate::rollback::RollbackStore;
+use crate::safety::Capabilities;
+use crate::services;
 
 // ---------------------------------------------------------------------------
 // Exit codes
@@ -201,14 +209,23 @@ pub fn parse() -> Cli {
 
 /// Dispatch the parsed CLI to the appropriate handler.
 ///
-/// Phase 3: all handlers are stubs; business logic is not yet implemented.
+/// Applies `--dry-run` / `--no-dry-run` overrides before routing.
 /// Returns an [`ExitCode`] for `main` to forward to the OS.
 #[must_use]
 pub fn dispatch(cli: &Cli, config: &AppConfig) -> ExitCode {
+    let mut cfg = config.clone();
+    if cli.dry_run {
+        cfg.global.dry_run = true;
+    }
+    if cli.no_dry_run {
+        cfg.global.dry_run = false;
+    }
+    let config = &cfg;
+
     match &cli.command {
-        Command::Status => run_stub("status"),
-        Command::Analyze => run_stub("analyze"),
-        Command::Doctor => run_stub("doctor"),
+        Command::Status => dispatch_status(cli, config),
+        Command::Analyze => dispatch_analyze(cli, config),
+        Command::Doctor => dispatch_doctor(cli, config),
         Command::Daemon => match crate::daemon::run(config.clone()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -218,12 +235,12 @@ pub fn dispatch(cli: &Cli, config: &AppConfig) -> ExitCode {
         },
         Command::Logs { .. } => run_stub("logs"),
         Command::Explain => run_stub("explain"),
-        Command::Pressure => run_stub("pressure"),
-        Command::Processes { .. } => run_stub("processes"),
-        Command::Services { .. } => run_stub("services"),
+        Command::Pressure => dispatch_pressure(cli, config),
+        Command::Processes { top } => dispatch_processes(cli, config, *top),
+        Command::Services { failed } => dispatch_services(cli, config, *failed),
         Command::Profile { cmd } => dispatch_profile(cmd),
-        Command::Config { cmd } => dispatch_config(cmd),
-        Command::Actions { cmd } => dispatch_actions(cmd),
+        Command::Config { cmd } => dispatch_config(cmd, config, cli.json),
+        Command::Actions { cmd } => dispatch_actions(cmd, cli, config),
         Command::Zram { cmd } => dispatch_zram(cmd),
         Command::Rollback { cmd } => dispatch_rollback(cmd, config),
         Command::Report { .. } => run_stub("report"),
@@ -238,26 +255,691 @@ pub fn dispatch(cli: &Cli, config: &AppConfig) -> ExitCode {
 // Private dispatch helpers
 // ---------------------------------------------------------------------------
 
+/// Convert safety capabilities to the metrics module's capability type (same fields, separate types).
+fn to_metrics_caps(caps: &Capabilities) -> metrics::Capabilities {
+    metrics::Capabilities {
+        has_psi: caps.has_psi,
+        has_cgroup_v2: caps.has_cgroup_v2,
+        has_systemd: caps.has_systemd,
+        is_root: caps.is_root,
+        has_zram: caps.has_zram,
+    }
+}
+
+/// Collect metrics or print error and return early.
+macro_rules! collect_metrics {
+    ($mcaps:expr) => {{
+        let mut prev = CpuSample::default();
+        match metrics::collect($mcaps, &mut prev) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error: metrics collection failed: {e:#}");
+                return ExitCode::from(exit_codes::RUNTIME_ERROR);
+            }
+        }
+    }};
+}
+
+fn yn(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn mb(kb: u64) -> f64 {
+    kb as f64 / 1024.0
+}
+
+// ---------------------------------------------------------------------------
+// analyze
+// ---------------------------------------------------------------------------
+
+#[must_use]
+#[allow(clippy::too_many_lines)]
+fn dispatch_analyze(cli: &Cli, config: &AppConfig) -> ExitCode {
+    let caps = Capabilities::detect();
+    let mcaps = to_metrics_caps(&caps);
+    let metrics_snap = collect_metrics!(&mcaps);
+
+    let profile_name = &config.global.profile;
+    let profile = profiles::resolve(profile_name, config);
+    let pressure_snap = pressure::compute(&mcaps, &metrics_snap, config, &[]);
+    let procs = processes::analyze(config);
+    let svcs = services::analyze(config);
+    let state = pressure::classify_state(&pressure_snap, &procs, &svcs, &mcaps);
+    let decision = policy::decide(state, &profile, &procs, &svcs);
+    let planned = actions::plan(&decision, &profile, &procs);
+    let results: Vec<_> = planned
+        .iter()
+        .map(|a| actions::simulate(a, config, &profile, &caps))
+        .collect();
+
+    if cli.json {
+        let json = serde_json::json!({
+            "capabilities": {
+                "root": caps.is_root,
+                "psi": caps.has_psi,
+                "cgroup_v2": caps.has_cgroup_v2,
+                "systemd": caps.has_systemd,
+                "zram": caps.has_zram,
+            },
+            "pressure": {
+                "level": format!("{:?}", pressure_snap.level),
+                "contributors": pressure_snap.contributors,
+                "cpu": { "some_avg10": pressure_snap.cpu.some_avg10,
+                          "some_avg60": pressure_snap.cpu.some_avg60,
+                          "some_avg300": pressure_snap.cpu.some_avg300 },
+                "memory": { "some_avg10": pressure_snap.memory.some_avg10,
+                             "full_avg10": pressure_snap.memory.full_avg10,
+                             "some_avg300": pressure_snap.memory.some_avg300 },
+                "io": { "some_avg10": pressure_snap.io.some_avg10,
+                         "some_avg60": pressure_snap.io.some_avg60,
+                         "some_avg300": pressure_snap.io.some_avg300 },
+            },
+            "memory": {
+                "total_mb": mb(metrics_snap.memory.total_kb),
+                "available_mb": mb(metrics_snap.memory.available_kb),
+                "swap_in_rate": metrics_snap.memory.swap_in_rate,
+            },
+            "cpu": {
+                "load_avg_1m": metrics_snap.cpu.load1,
+                "pct": metrics_snap.cpu.utilization_pct,
+            },
+            "state": format!("{state:?}"),
+            "profile": format!("{profile_name:?}"),
+            "policy": {
+                "intent": format!("{:?}", decision.intent),
+                "rationale": decision.rationale,
+            },
+            "actions": results.iter().map(|r| serde_json::json!({
+                "id": r.action_id,
+                "status": format!("{:?}", r.status),
+                "message": r.message,
+            })).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    println!("Capabilities");
+    println!(
+        "  root:      {:<4}  {}",
+        yn(caps.is_root),
+        if caps.is_root {
+            ""
+        } else {
+            "(dry-run enforced; real actions require root)"
+        }
+    );
+    println!("  PSI:       {}", yn(caps.has_psi));
+    println!("  cgroup v2: {}", yn(caps.has_cgroup_v2));
+    println!("  systemd:   {}", yn(caps.has_systemd));
+    println!("  zram:      {}", yn(caps.has_zram));
+
+    println!();
+    println!("Pressure  [{:?}]", pressure_snap.level);
+    println!(
+        "  cpu     some10={:.2}  some60={:.2}  some300={:.2}",
+        pressure_snap.cpu.some_avg10, pressure_snap.cpu.some_avg60, pressure_snap.cpu.some_avg300
+    );
+    println!(
+        "  memory  some10={:.2}  full10={:.2}  some300={:.2}",
+        pressure_snap.memory.some_avg10,
+        pressure_snap.memory.full_avg10,
+        pressure_snap.memory.some_avg300
+    );
+    println!(
+        "  io      some10={:.2}  some60={:.2}  some300={:.2}",
+        pressure_snap.io.some_avg10, pressure_snap.io.some_avg60, pressure_snap.io.some_avg300
+    );
+    if !pressure_snap.contributors.is_empty() {
+        println!("  contributors: {}", pressure_snap.contributors.join(", "));
+    }
+
+    let avail_pct = if metrics_snap.memory.total_kb > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let pct =
+            metrics_snap.memory.available_kb as f64 / metrics_snap.memory.total_kb as f64 * 100.0;
+        format!("{pct:.1}% available")
+    } else {
+        "unknown".to_string()
+    };
+    println!();
+    println!(
+        "Memory   {:.0} MB total  {:.0} MB available  ({avail_pct})  swap_in={:.1} pg/s",
+        mb(metrics_snap.memory.total_kb),
+        mb(metrics_snap.memory.available_kb),
+        metrics_snap.memory.swap_in_rate
+    );
+    println!(
+        "CPU      load={:.2}  pct={:.1}%",
+        metrics_snap.cpu.load1, metrics_snap.cpu.utilization_pct
+    );
+
+    println!();
+    println!("State:   {state:?}");
+    println!("Profile: {profile_name:?}");
+    println!("Policy:  {:?}", decision.intent);
+    println!("         \"{}\"", decision.rationale);
+
+    println!();
+    if results.is_empty() {
+        println!("Actions  none");
+    } else {
+        println!("Actions  {} planned:", results.len());
+        for r in &results {
+            println!(
+                "  [{}]  {:?}  {}",
+                r.action_id,
+                planned
+                    .iter()
+                    .find(|a| a.id == r.action_id)
+                    .map(|a| format!("{:?}  {:?}  {:?}", a.kind, a.risk, a.target))
+                    .unwrap_or_default(),
+                r.message
+            );
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------------
+
+#[must_use]
+fn dispatch_status(cli: &Cli, config: &AppConfig) -> ExitCode {
+    let caps = Capabilities::detect();
+    let mcaps = to_metrics_caps(&caps);
+    let metrics_snap = collect_metrics!(&mcaps);
+
+    let profile_name = &config.global.profile;
+    let profile = profiles::resolve(profile_name, config);
+    let pressure_snap = pressure::compute(&mcaps, &metrics_snap, config, &[]);
+    // Use empty process/service lists for a fast status query — just pressure state.
+    let state = pressure::classify_state(&pressure_snap, &[], &[], &mcaps);
+
+    if cli.json {
+        let avail_pct = if metrics_snap.memory.total_kb > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                metrics_snap.memory.available_kb as f64 / metrics_snap.memory.total_kb as f64
+                    * 100.0
+            }
+        } else {
+            0.0
+        };
+        let json = serde_json::json!({
+            "state": format!("{state:?}"),
+            "pressure_level": format!("{:?}", pressure_snap.level),
+            "cpu_some_avg10": pressure_snap.cpu.some_avg10,
+            "mem_some_avg10": pressure_snap.memory.some_avg10,
+            "io_some_avg10": pressure_snap.io.some_avg10,
+            "memory_total_mb": mb(metrics_snap.memory.total_kb),
+            "memory_available_mb": mb(metrics_snap.memory.available_kb),
+            "memory_available_pct": avail_pct,
+            "cpu_load_avg_1m": metrics_snap.cpu.load1,
+            "cpu_pct": metrics_snap.cpu.utilization_pct,
+            "profile": format!("{profile_name:?}"),
+            "dry_run": config.global.dry_run,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let avail_pct = if metrics_snap.memory.total_kb > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let p =
+            metrics_snap.memory.available_kb as f64 / metrics_snap.memory.total_kb as f64 * 100.0;
+        format!("{p:.1}%")
+    } else {
+        "?".to_string()
+    };
+    println!("State:    {state:?}");
+    println!(
+        "Pressure: {:?}  [cpu={:.2}% mem={:.2}% io={:.2}% some_avg10]",
+        pressure_snap.level,
+        pressure_snap.cpu.some_avg10,
+        pressure_snap.memory.some_avg10,
+        pressure_snap.io.some_avg10
+    );
+    println!(
+        "Memory:   {:.0}/{:.0} MB  ({avail_pct} available)",
+        mb(metrics_snap.memory.available_kb),
+        mb(metrics_snap.memory.total_kb)
+    );
+    println!(
+        "CPU:      load={:.2}  pct={:.1}%",
+        metrics_snap.cpu.load1, metrics_snap.cpu.utilization_pct
+    );
+    println!(
+        "Profile:  {:?}  (max_risk={:?}  dry_run={})",
+        profile_name,
+        profile.max_allowed_risk,
+        yn(config.global.dry_run)
+    );
+
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// pressure
+// ---------------------------------------------------------------------------
+
+#[must_use]
+fn dispatch_pressure(cli: &Cli, config: &AppConfig) -> ExitCode {
+    let caps = Capabilities::detect();
+    let mcaps = to_metrics_caps(&caps);
+    let metrics_snap = collect_metrics!(&mcaps);
+    let pressure_snap = pressure::compute(&mcaps, &metrics_snap, config, &[]);
+
+    if cli.json {
+        let json = serde_json::json!({
+            "level": format!("{:?}", pressure_snap.level),
+            "contributors": pressure_snap.contributors,
+            "cpu": {
+                "some_avg10": pressure_snap.cpu.some_avg10,
+                "some_avg60": pressure_snap.cpu.some_avg60,
+                "some_avg300": pressure_snap.cpu.some_avg300,
+                "total_us": pressure_snap.cpu.total_us,
+            },
+            "memory": {
+                "some_avg10": pressure_snap.memory.some_avg10,
+                "some_avg60": pressure_snap.memory.some_avg60,
+                "some_avg300": pressure_snap.memory.some_avg300,
+                "full_avg10": pressure_snap.memory.full_avg10,
+                "full_avg60": pressure_snap.memory.full_avg60,
+                "full_avg300": pressure_snap.memory.full_avg300,
+                "total_us": pressure_snap.memory.total_us,
+            },
+            "io": {
+                "some_avg10": pressure_snap.io.some_avg10,
+                "some_avg60": pressure_snap.io.some_avg60,
+                "some_avg300": pressure_snap.io.some_avg300,
+                "full_avg10": pressure_snap.io.full_avg10,
+                "full_avg60": pressure_snap.io.full_avg60,
+                "full_avg300": pressure_snap.io.full_avg300,
+                "total_us": pressure_snap.io.total_us,
+            },
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    println!(
+        "{:<8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "resource", "some10", "some60", "some300", "full10", "full60", "full300"
+    );
+    println!(
+        "{:<8}  {:>7.2}%  {:>7.2}%  {:>7.2}%  {:>8}  {:>8}  {:>8}",
+        "cpu",
+        pressure_snap.cpu.some_avg10,
+        pressure_snap.cpu.some_avg60,
+        pressure_snap.cpu.some_avg300,
+        "—",
+        "—",
+        "—"
+    );
+    println!(
+        "{:<8}  {:>7.2}%  {:>7.2}%  {:>7.2}%  {:>7.2}%  {:>7.2}%  {:>7.2}%",
+        "memory",
+        pressure_snap.memory.some_avg10,
+        pressure_snap.memory.some_avg60,
+        pressure_snap.memory.some_avg300,
+        pressure_snap.memory.full_avg10,
+        pressure_snap.memory.full_avg60,
+        pressure_snap.memory.full_avg300
+    );
+    println!(
+        "{:<8}  {:>7.2}%  {:>7.2}%  {:>7.2}%  {:>7.2}%  {:>7.2}%  {:>7.2}%",
+        "io",
+        pressure_snap.io.some_avg10,
+        pressure_snap.io.some_avg60,
+        pressure_snap.io.some_avg300,
+        pressure_snap.io.full_avg10,
+        pressure_snap.io.full_avg60,
+        pressure_snap.io.full_avg300
+    );
+    println!();
+    println!("Level: {:?}", pressure_snap.level);
+    if !pressure_snap.contributors.is_empty() {
+        println!("Contributors: {}", pressure_snap.contributors.join(", "));
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// doctor
+// ---------------------------------------------------------------------------
+
+#[must_use]
+fn dispatch_doctor(cli: &Cli, config: &AppConfig) -> ExitCode {
+    let caps = Capabilities::detect();
+
+    if cli.json {
+        let json = serde_json::json!({
+            "root": caps.is_root,
+            "psi": caps.has_psi,
+            "cgroup_v2": caps.has_cgroup_v2,
+            "systemd": caps.has_systemd,
+            "zram": caps.has_zram,
+            "dry_run": config.global.dry_run,
+            "profile": format!("{:?}", config.global.profile),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    println!(
+        "  root:      {:<4}  {}",
+        yn(caps.is_root),
+        if caps.is_root {
+            ""
+        } else {
+            "(dry-run enforced; real actions require root + --no-dry-run)"
+        }
+    );
+    println!("  PSI:       {:<4}  /proc/pressure/cpu", yn(caps.has_psi));
+    println!(
+        "  cgroup v2: {:<4}  /sys/fs/cgroup/cgroup.controllers",
+        yn(caps.has_cgroup_v2)
+    );
+    println!(
+        "  systemd:   {:<4}  /run/systemd/private",
+        yn(caps.has_systemd)
+    );
+    println!("  zram:      {:<4}  /sys/block/zram0", yn(caps.has_zram));
+    println!();
+    println!("  profile:   {:?}", config.global.profile);
+    println!("  dry_run:   {}", yn(config.global.dry_run));
+
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// processes
+// ---------------------------------------------------------------------------
+
+#[must_use]
+fn dispatch_processes(cli: &Cli, config: &AppConfig, top: Option<usize>) -> ExitCode {
+    let procs = processes::analyze(config);
+    let procs: Vec<_> = if let Some(n) = top {
+        let mut sorted = procs;
+        sorted.sort_by(|a, b| {
+            b.rss_kb.cmp(&a.rss_kb).then(
+                b.cpu_pct
+                    .partial_cmp(&a.cpu_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        sorted.into_iter().take(n).collect()
+    } else {
+        procs
+    };
+
+    if cli.json {
+        let json: Vec<_> = procs
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "pid": p.pid,
+                    "comm": p.comm,
+                    "cpu_pct": p.cpu_pct,
+                    "rss_mb": mb(p.rss_kb),
+                    "nice": p.nice,
+                    "protected": p.is_protected,
+                    "flags": p.flags.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    println!(
+        "{:<7}  {:<16}  {:>6}  {:>8}  FLAGS",
+        "PID", "COMM", "CPU%", "RSS MB"
+    );
+    for p in &procs {
+        let flags: Vec<_> = p.flags.iter().map(|f| format!("{f:?}")).collect();
+        println!(
+            "{:<7}  {:<16}  {:>5.1}%  {:>7.1}  {}",
+            p.pid,
+            p.comm,
+            p.cpu_pct,
+            mb(p.rss_kb),
+            if flags.is_empty() {
+                String::new()
+            } else {
+                flags.join(" ")
+            }
+        );
+    }
+    if procs.is_empty() {
+        println!("(no processes found — may require /proc access)");
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// services
+// ---------------------------------------------------------------------------
+
+#[must_use]
+fn dispatch_services(cli: &Cli, config: &AppConfig, failed_only: bool) -> ExitCode {
+    let svcs = services::analyze(config);
+    let svcs: Vec<_> = if failed_only {
+        svcs.into_iter()
+            .filter(|s| s.active_state != "active" && s.active_state != "activating")
+            .collect()
+    } else {
+        svcs
+    };
+
+    if cli.json {
+        let json: Vec<_> = svcs
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "unit": s.unit,
+                    "active_state": s.active_state,
+                    "protected": s.is_protected,
+                    "allowed": s.is_allowed,
+                    "flags": s.flags.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    println!("{:<36}  {:<12}  FLAGS", "UNIT", "STATE");
+    for s in &svcs {
+        let flags: Vec<_> = s.flags.iter().map(|f| format!("{f:?}")).collect();
+        println!(
+            "{:<36}  {:<12}  {}",
+            s.unit,
+            s.active_state,
+            if flags.is_empty() {
+                String::new()
+            } else {
+                flags.join(" ")
+            }
+        );
+    }
+    if svcs.is_empty() {
+        let reason = if failed_only {
+            "no failed/degraded services found"
+        } else {
+            "no services found — systemd or D-Bus may be unavailable"
+        };
+        println!("({reason})");
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// profile / config / actions / zram (partially stubbed)
+// ---------------------------------------------------------------------------
+
 #[must_use]
 fn dispatch_profile(cmd: &ProfileCommand) -> ExitCode {
     match cmd {
-        ProfileCommand::List => run_stub("profile list"),
+        ProfileCommand::List => {
+            let names = [
+                (
+                    "conservative",
+                    "Safe-only: observe and log. No system changes.",
+                ),
+                (
+                    "balanced",
+                    "Moderate: nice + cpu_weight + memory_high on allowed services.",
+                ),
+                (
+                    "performance",
+                    "Aggressive: nice + ionice + all cgroup limits + zram.",
+                ),
+                ("low_ram", "Tuned for ≤4 GB RAM; tight memory thresholds."),
+                ("desktop", "Desktop workstation; protect UI processes."),
+                ("server", "Server; conservative with service management."),
+                ("developer", "Developer; wider allowlists, short intervals."),
+            ];
+            println!("{:<16}  DESCRIPTION", "PROFILE");
+            for (name, desc) in names {
+                println!("{name:<16}  {desc}");
+            }
+            ExitCode::SUCCESS
+        }
         ProfileCommand::Set { .. } => run_stub("profile set"),
     }
 }
 
 #[must_use]
-fn dispatch_config(cmd: &ConfigCommand) -> ExitCode {
+fn dispatch_config(cmd: &ConfigCommand, config: &AppConfig, json: bool) -> ExitCode {
     match cmd {
-        ConfigCommand::Show => run_stub("config show"),
-        ConfigCommand::Validate => run_stub("config validate"),
+        ConfigCommand::Show => {
+            if json {
+                match serde_json::to_string_pretty(config) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(exit_codes::RUNTIME_ERROR);
+                    }
+                }
+            } else {
+                match toml::to_string_pretty(config) {
+                    Ok(s) => print!("{s}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(exit_codes::RUNTIME_ERROR);
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        ConfigCommand::Validate => {
+            let issues = config::validate(config);
+            if issues.is_empty() {
+                println!("Config is valid (no issues found).");
+            } else {
+                println!("{} issue(s) found:", issues.len());
+                for issue in &issues {
+                    println!("  {issue}");
+                }
+                return ExitCode::from(exit_codes::VALIDATION_FAILED);
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 
 #[must_use]
-fn dispatch_actions(cmd: &ActionsCommand) -> ExitCode {
+fn dispatch_actions(cmd: &ActionsCommand, cli: &Cli, config: &AppConfig) -> ExitCode {
     match cmd {
-        ActionsCommand::DryRun => run_stub("actions dry-run"),
+        ActionsCommand::DryRun => {
+            let caps = Capabilities::detect();
+            let mcaps = to_metrics_caps(&caps);
+            let metrics_snap = collect_metrics!(&mcaps);
+
+            let profile_name = &config.global.profile;
+            let profile = profiles::resolve(profile_name, config);
+            let pressure_snap = pressure::compute(&mcaps, &metrics_snap, config, &[]);
+            let procs = processes::analyze(config);
+            let svcs = services::analyze(config);
+            let state = pressure::classify_state(&pressure_snap, &procs, &svcs, &mcaps);
+            let decision = policy::decide(state, &profile, &procs, &svcs);
+            let planned = actions::plan(&decision, &profile, &procs);
+            let results: Vec<_> = planned
+                .iter()
+                .map(|a| actions::simulate(a, config, &profile, &caps))
+                .collect();
+
+            if cli.json {
+                let json = serde_json::json!({
+                    "state": format!("{state:?}"),
+                    "intent": format!("{:?}", decision.intent),
+                    "rationale": decision.rationale,
+                    "actions": results.iter().zip(planned.iter()).map(|(r, a)| serde_json::json!({
+                        "id": r.action_id,
+                        "kind": format!("{:?}", a.kind),
+                        "risk": format!("{:?}", a.risk),
+                        "target": format!("{:?}", a.target),
+                        "status": format!("{:?}", r.status),
+                        "message": r.message,
+                    })).collect::<Vec<_>>(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json).unwrap_or_default()
+                );
+                return ExitCode::SUCCESS;
+            }
+
+            println!("State:   {state:?}");
+            println!("Policy:  {:?}", decision.intent);
+            println!("         \"{}\"", decision.rationale);
+            println!();
+            if results.is_empty() {
+                println!("Actions: none");
+            } else {
+                println!("Actions: {} planned:", results.len());
+                for (r, a) in results.iter().zip(planned.iter()) {
+                    println!(
+                        "  [{}]  {:?}  risk={:?}  target={:?}",
+                        r.action_id, a.kind, a.risk, a.target
+                    );
+                    println!("       Status: {:?}", r.status);
+                    println!("       {}", r.message);
+                }
+            }
+
+            ExitCode::SUCCESS
+        }
         ActionsCommand::Apply => run_stub("actions apply"),
     }
 }
