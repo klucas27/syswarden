@@ -435,6 +435,18 @@ Conventions for every module below: **Responsibility / Inputs / Outputs / Intern
 - **Public data contracts:** Report structs.
 - **Testing:** Aggregation math over fixture history.
 
+### 5.20 `sysctl`
+- **Responsibility:** Read current kernel tunables; (gated, v0.3+) apply `sysctl` changes with prior-state backup for rollback. Mirrors the `zram`/`cgroups` split: read-first, apply behind gates.
+- **Inputs:** `PlannedAction` (`ApplySysctl`), key/value params, `Capabilities`.
+- **Outputs:** Applied tunable + backup recorded in the rollback store, or `Blocked`/`Failed`.
+- **Internal deps:** safety (mandatory), rollback, logging.
+- **External deps:** none — reads/writes `/proc/sys/<key>` via explicit paths only; never the `sysctl` binary, never a shell (§17 "No shell interpolation").
+- **Permissions:** Root + writable `/proc/sys`; the unit must relax `ProtectKernelTunables` only when sysctl apply is enabled (§18).
+- **Failure modes:** Missing/unwritable key → `Failed`, never crash; non-root → blocked.
+- **Not allowed to decide:** Which keys to change (config/policy supplies them) or action safety (safety layer).
+- **Public data contracts:** Reuses `PlannedAction`/`ActionResult`/`ActionKind::{ApplySysctl, CreateBackup}` (§15) — no new contract.
+- **Testing:** Fixture `/proc/sys` read; backup capture round-trip; mocked apply; dry-run ⇒ zero writes.
+
 ---
 
 ## 6. Daemon Lifecycle
@@ -860,7 +872,9 @@ syswarden/
 │   │   └── mod.rs
 │   ├── explain/
 │   │   └── mod.rs
-│   └── reports/
+│   ├── reports/
+│   │   └── mod.rs
+│   └── sysctl/
 │       └── mod.rs
 ├── tests/
 │   ├── config_tests.rs
@@ -1045,7 +1059,7 @@ syswarden explicitly cannot:
 
 - **v0.1 (MVP)** — Observe-only intelligence: config, CLI, metrics, PSI, pressure classification, process/service analysis, profiles, policy engine, safety layer, dry-run action planning, daemon loop, JSONL history + audit, rollback metadata scaffolding, systemd unit (manual install). No real state changes by default.
 - **v0.2 (safe actions)** — Enable moderate actions behind flags: `nice`/`ionice` on allowed non-protected processes; `CPUWeight`/`IOWeight`/`MemoryHigh` on allowlisted services; full rollback for these.
-- **v0.3 (systemd/cgroup control)** — Mature transient + persistent drop-in management; richer cgroup reads; service rule engine.
+- **v0.3 (systemd/cgroup control + gated aggressive actions)** — Mature transient + persistent drop-in management; richer cgroup reads; service rule engine; and the gated *aggressive* actions: `MemoryMax` (only after `MemoryHigh` has been tried), allowlisted service restart/stop, and `sysctl` apply (with backup + rollback). All stay off by default and behind `allow_aggressive_actions` / `allow_sysctl_apply`; "battle-tested" hardening of the aggressive set remains the v1.0 bar.
 - **v0.4 (zram/zswap management)** — Detection-first zram/zswap recommendations and gated apply with rollback; `zram-generator` integration.
 - **v1.0 (stable)** — Hardened, documented, AUR-packaged; aggressive actions fully gated and battle-tested; comprehensive tests.
 - **Future ideas** — Optional local-only trend learning (still deterministic and explainable), per-cgroup adaptive weights, TUI dashboard, additional distro support — none involving networked or generative AI.
