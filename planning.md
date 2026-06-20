@@ -569,3 +569,61 @@ Hand off after each phase with: a list of changed files, the checks run and thei
 - With `dry_run = true` (default): byte-for-byte identical behavior to v0.1 — zero system changes.
 - With opt-in (`dry_run = false` + Moderate profile + allowlist): moderate actions apply, are audited, and each is reversible via `rollback apply <id>`.
 - Protected sets, non-root blocking, and fail-closed defaults still hold; no prohibited or aggressive action is executable.
+
+---
+
+## 18. Version 0.3 Plan — systemd/cgroup Maturity + Gated Aggressive Actions
+
+> **Status:** v0.3 complete (Phases 29–36). Version bumped to 0.3.0. Dev gate green — 335 tests pass.
+> **Same rules apply:** follow `architecture.md`, implement strictly one phase at a time in order, report changed files, run the dev gate. **Owner-approved architecture deltas for v0.3 only:** new `sysctl` module (architecture.md §5.20 + tree §14) and the reconciled v0.3 roadmap line (§23). No other architecture changes.
+
+### 18.1 Scope (architecture.md §10 "Aggressive actions", §23, §5.8/§5.9/§5.20)
+
+**In scope:**
+- **Persistent drop-in management** (architecture.md §5.8) — render + write `/etc/systemd/system/<unit>.d/50-syswarden.conf`, `daemon-reload`, with prior-state backup. Complements the v0.2 transient runtime properties.
+- **Richer cgroup reads** (§5.9) — more controllers/stats for decisions and post-apply verification.
+- **Service rule engine** (§5.7) — evaluate config `service_rules` to drive service decisions.
+- **Gated aggressive actions** (§10), each behind `allow_aggressive_actions=true` + allowlist + full rollback:
+  - `SetMemoryMax` — **only after `MemoryHigh` has been tried** on the target (architecture.md §15 forbidden order).
+  - `RestartService` / `StopService` — allowlisted, non-protected, non-critical services only.
+  - `ApplySysctl` — additionally requires `allow_sysctl_apply=true` + backup (`CreateBackup`) + rollback; writes `/proc/sys/<key>` via explicit paths only (never the `sysctl` binary, never a shell).
+
+**Explicitly OUT of scope (later — do not implement):**
+- zram / zswap apply → v0.4.
+- Any new destructive capability (process kill, package removal, fstab/bootloader, cache drop) — **never**.
+- Network of any kind — **never**.
+
+### 18.2 Invariants (no architecture drift beyond the approved deltas)
+
+- **No new config fields, enums, CLI commands, or profiles.** `ActionKind::{SetMemoryMax, RestartService, StopService, ApplySysctl, CreateBackup}` already exist (architecture.md §15); flags `allow_aggressive_actions` / `allow_sysctl_apply` already exist (§15). The only structural addition is the `sysctl` module (§5.20, approved).
+- **Every execute path routes through `safety::evaluate` first**; the §17 gate order is unchanged. Execution triggers **only** on `SafetyDecision::Allow`.
+- **Aggressive gating:** an aggressive action executes only when all align — `dry_run = false` **and** `allow_aggressive_actions = true` **and** the active profile permits `Aggressive` risk (`conservative`/`balanced` never do; architecture.md §11) **and** target is non-protected / allowlisted. `ApplySysctl` additionally needs `allow_sysctl_apply = true`.
+- **Backup before persistent edits** (architecture.md §17 backup policy): every persistent drop-in write and every sysctl change first records prior state (`CreateBackup`) in the rollback store; revert restores it.
+- **Defense in depth:** re-check protected/allowlist/flags at execute time, not only at plan time.
+- Safety defaults unchanged: `dry_run = true` default, protected sets intact, non-root blocks state changes, fail-closed.
+
+### 18.3 Phases (implement in order)
+
+- ✅ **Phase 29 — `systemd` persistent drop-in write layer (§5.8).** Render `/etc/systemd/system/<unit>.d/50-syswarden.conf`; write + `daemon-reload` via D-Bus; capture prior drop-in (content or absence) for rollback. The transient-vs-persistent choice lives in `actions`. Mocked tests + one `#[ignore]` live test. *Acceptance:* no shell; writes only under `/etc/systemd/system/<unit>.d/`; prior state captured.
+- ✅ **Phase 30 — drop-in backup + rollback (`CreateBackup`, §5.15, §17 backup policy).** `rollback::apply` restores a persistent drop-in: rewrite prior content or remove a file that did not exist before, then `daemon-reload`. Refuse on changed/missing target; never panic. Round-trip + revert tests. *Acceptance:* every persistent change reversible; missing prior state refuses cleanly.
+- ✅ **Phase 31 — richer `cgroups` reads (§5.9).** Extend `read(unit_path)` for the controllers/stats needed by decisions and post-apply verification. Read-only; writes still go through `systemd`. Fixture cgroup-tree tests. *Acceptance:* read-only; values match fixtures.
+- ✅ **Phase 32 — service rule engine (§5.7).** Evaluate config `service_rules` (allowlist/threshold-driven) to produce `ServiceFlag`s/decisions. Deterministic; never acts directly. Decision-table tests. *Acceptance:* rules drive flags; protected/non-allowlisted untouched.
+- ✅ **Phase 33 — `SetMemoryMax` executor (aggressive, §5.12).** Gated; **only after `MemoryHigh` has been tried** on the target. Apply via the `systemd` layer (transient or persistent), capture prior, record rollback. *Acceptance:* never runs before `MemoryHigh`; only on allowlisted services; reversible.
+- ✅ **Phase 34 — service restart/stop executor (aggressive, §5.12).** `RestartService`/`StopService` on allowlisted non-protected, non-critical services via D-Bus (`RestartUnit`/`StopUnit`). Capture prior active-state; revert re-starts a stopped unit. Re-check allowlist + protected at execute time. *Acceptance:* protected/critical hard-blocked; empty allowlist ⇒ nothing actionable.
+- ✅ **Phase 35 — `sysctl` module + `ApplySysctl` executor (aggressive, §5.20).** New `src/sysctl/mod.rs`: `detect`/read `/proc/sys/<key>`, `apply` = backup prior (`CreateBackup`) → write explicit path → verify. Requires `allow_aggressive_actions` + `allow_sysctl_apply` + backup + rollback. Unit relaxes `ProtectKernelTunables` only when enabled (§18). Fixture read + mocked apply + dry-run-zero-writes tests. *Acceptance:* no shell/no `sysctl` binary; non-root blocks; reversible.
+- ✅ **Phase 36 — tests, docs, version.** Live `#[ignore]` integration (real persistent drop-in on a dummy unit; real `sysctl` round-trip on a safe key; real restart on a throwaway unit). Update `README.md`/`docs/usage.md` with the aggressive opt-in recipe (`dry_run=false` + Aggressive-permitting profile + `allow_aggressive_actions` + allowlist; `allow_sysctl_apply` for sysctl). Add an ADR for persistent drop-ins + aggressive gating. Bump version to `0.3.0`. Run the full dev gate. *Acceptance:* gate green; docs explain the opt-in; default config still makes zero system changes.
+
+### 18.4 Forbidden order (v0.3)
+
+- Do not implement any aggressive executor before `safety` and `rollback` real-revert exist (they do, from v0.2) **and** the relevant capture/backup phase precedes it.
+- Do not implement `SetMemoryMax` before its "after `MemoryHigh` tried" guard is in place (Phase 33 depends on the v0.2 `MemoryHigh` path).
+- Do not implement `ApplySysctl` before backup + rollback for it exist (within Phase 35) — never write `/proc/sys` without a recorded prior value.
+- Do not implement persistent drop-ins (Phase 29) without their backup/rollback (Phase 30) landing in the same version.
+- Do not implement zram/zswap apply (v0.4), process killing, package removal, cache dropping, or any network — ever.
+
+### 18.5 Definition of done (v0.3)
+
+- Phases 29–36 complete; dev gate green.
+- With `dry_run = true` (default): zero system changes — identical to v0.1/v0.2 defaults.
+- With opt-in (`dry_run=false` + Aggressive-permitting profile + `allow_aggressive_actions` + allowlist; `+ allow_sysctl_apply` for sysctl): persistent drop-ins, `MemoryMax`, allowlisted restart/stop, and `sysctl` apply work, are audited, and each is reversible via `rollback apply <id>`.
+- Protected sets, non-root blocking, and fail-closed defaults still hold; zram/zswap apply remains deferred to v0.4; no prohibited or never-allowed action is executable.
