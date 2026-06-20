@@ -1,18 +1,19 @@
-//! systemd D-Bus integration: unit property reads and transient resource-control writes
-//! (architecture.md §5.8, §18).
+//! systemd D-Bus integration: unit property reads, transient and persistent resource-control
+//! writes (architecture.md §5.8, §18, Phase 29).
 //!
 //! ## Invariants
 //! - All D-Bus calls use explicit typed arguments — no shell, no string interpolation
 //!   (architecture.md §17).
-//! - Writes are transient (`runtime = true`) per architecture.md §18:
-//!   "prefer transient runtime properties for temporary pressure response."
-//! - `set_unit_properties` captures prior state and returns it to the caller so it can be
-//!   stored in `RollbackEntry.prior_state` (architecture.md §5.15).
+//! - Persistent drop-ins are written only under `/etc/systemd/system/<unit>.d/`; path
+//!   components are validated to prevent traversal (architecture.md §17).
+//! - `set_unit_properties` and `write_drop_in` capture prior state and return it so the caller
+//!   can record it in `RollbackEntry.prior_state` (architecture.md §5.15).
 //! - No safety decisions are made here; the caller is responsible for all gating.
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,33 @@ const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 const PROP_CPU_WEIGHT: &str = "CPUWeight";
 const PROP_IO_WEIGHT: &str = "IOWeight";
 const PROP_MEMORY_HIGH: &str = "MemoryHigh";
+
+// Drop-in file constants (Phase 29, architecture.md §5.8).
+const DROPIN_DIR_BASE: &str = "/etc/systemd/system";
+const DROPIN_FILENAME: &str = "50-syswarden.conf";
+const KNOWN_UNIT_SUFFIXES: &[&str] = &[
+    ".service", ".mount", ".socket", ".target", ".timer", ".scope", ".slice",
+];
+
+// ---------------------------------------------------------------------------
+// DropInPriorState (Phase 29)
+// ---------------------------------------------------------------------------
+
+/// Prior state of the persistent drop-in file before syswarden wrote it.
+///
+/// Stored in `RollbackEntry.prior_state` (architecture.md §5.15).
+/// `prior_content = None` means the file did not exist before we created it.
+/// `written_content` is the exact bytes we wrote, used by rollback to detect
+/// external modifications before reverting (Phase 30).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DropInPriorState {
+    /// Absolute path of the drop-in we wrote.
+    pub path: PathBuf,
+    /// Content that was in the file before we wrote it; `None` = did not exist.
+    pub prior_content: Option<String>,
+    /// Exact content syswarden wrote — used by rollback to detect tampering.
+    pub written_content: String,
+}
 
 // ---------------------------------------------------------------------------
 // UnitProps
@@ -117,9 +145,147 @@ pub fn set_unit_properties(unit: &str, new_props: &UnitProps, runtime: bool) -> 
     Ok(prior)
 }
 
+/// Write a persistent drop-in for `unit` at
+/// `/etc/systemd/system/<unit>.d/50-syswarden.conf` and issue `daemon-reload`
+/// via D-Bus (architecture.md §5.8, Phase 29).
+///
+/// Steps:
+/// 1. Validate `unit` name (no `/`, no `..`, known suffix).
+/// 2. Capture prior state (file content or absence).
+/// 3. Render `[Service]` INI section from `props`.
+/// 4. Write the file (creates the `.d` dir if needed).
+/// 5. Issue `Manager.Reload` via D-Bus.
+/// 6. Return `DropInPriorState` for the caller to record in rollback.
+///
+/// # Errors
+/// Invalid unit name; path traversal detected; file write fails; D-Bus unavailable.
+///
+/// # Panics
+/// Never in practice — `resolve_drop_in_path` always returns a path with a parent component.
+pub fn write_drop_in(unit: &str, props: &UnitProps) -> Result<DropInPriorState> {
+    let path = resolve_drop_in_path(unit)?;
+    let prior_content = read_drop_in_content(&path);
+    let written_content = render_drop_in(props);
+
+    let dir = path.parent().expect("drop-in path always has a parent dir");
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("systemd: create drop-in dir {d}", d = dir.display()))?;
+
+    std::fs::write(&path, &written_content)
+        .with_context(|| format!("systemd: write drop-in {p}", p = path.display()))?;
+
+    daemon_reload()?;
+
+    Ok(DropInPriorState {
+        path,
+        prior_content,
+        written_content,
+    })
+}
+
+/// Remove the syswarden drop-in for `unit` and issue `daemon-reload`.
+///
+/// No-op if the file does not exist. Used by Phase 30 rollback when the
+/// prior state was `None` (syswarden created the file from scratch).
+///
+/// # Errors
+/// Invalid unit name; file removal fails; D-Bus unavailable.
+pub fn remove_drop_in(unit: &str) -> Result<()> {
+    let path = resolve_drop_in_path(unit)?;
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("systemd: remove drop-in {}", path.display()))?;
+    }
+    daemon_reload()
+}
+
+/// Issue `org.freedesktop.systemd1.Manager.Reload` via the system D-Bus (no shell).
+///
+/// # Errors
+/// System D-Bus unavailable; Reload call rejected by systemd.
+pub fn daemon_reload() -> Result<()> {
+    let conn = Connection::system().context("systemd: connect to system D-Bus")?;
+    let manager = zbus::blocking::Proxy::new(&conn, SYSTEMD_BUS, MANAGER_PATH, MANAGER_IFACE)
+        .context("systemd: create manager proxy")?;
+    manager
+        .call::<_, _, ()>("Reload", &())
+        .context("systemd: Manager.Reload failed")?;
+    Ok(())
+}
+
+/// Render a `[Service]` INI drop-in from `props` (Phase 29).
+///
+/// `MemoryHigh = u64::MAX` is rendered as `infinity` (systemd's keyword for
+/// unlimited). Fields set to `None` are omitted entirely.
+///
+/// Exposed for unit tests (no D-Bus required).
+#[must_use]
+pub fn render_drop_in(props: &UnitProps) -> String {
+    let mut lines = vec!["[Service]".to_string()];
+    if let Some(w) = props.cpu_weight {
+        lines.push(format!("CPUWeight={w}"));
+    }
+    if let Some(w) = props.io_weight {
+        lines.push(format!("IOWeight={w}"));
+    }
+    if let Some(h) = props.memory_high {
+        if h == u64::MAX {
+            lines.push("MemoryHigh=infinity".to_string());
+        } else {
+            lines.push(format!("MemoryHigh={h}"));
+        }
+    }
+    lines.push(String::new()); // trailing newline
+    lines.join("\n")
+}
+
+/// Resolve and validate the drop-in path for `unit`.
+///
+/// Rejects empty names, names containing `/` or `..`, and names without a
+/// recognised systemd unit suffix. Then confirms the canonicalised result is
+/// strictly under `DROPIN_DIR_BASE` (defence against unexpected path joining).
+///
+/// Exposed for unit tests.
+///
+/// # Errors
+/// Invalid unit name or resulting path escapes `DROPIN_DIR_BASE`.
+pub fn resolve_drop_in_path(unit: &str) -> Result<PathBuf> {
+    if unit.is_empty() || unit.contains('/') || unit.contains("..") {
+        anyhow::bail!(
+            "systemd: invalid unit name {unit:?} — empty, contains '/', or contains '..'"
+        );
+    }
+    if !KNOWN_UNIT_SUFFIXES.iter().any(|s| unit.ends_with(s)) {
+        anyhow::bail!("systemd: unit {unit:?} lacks a known suffix ({KNOWN_UNIT_SUFFIXES:?})");
+    }
+    let path = PathBuf::from(DROPIN_DIR_BASE)
+        .join(format!("{unit}.d"))
+        .join(DROPIN_FILENAME);
+    // Double-check: resulting path must still be under DROPIN_DIR_BASE.
+    if !path.starts_with(DROPIN_DIR_BASE) {
+        anyhow::bail!(
+            "systemd: resolved drop-in path {p} escapes base dir {DROPIN_DIR_BASE}",
+            p = path.display()
+        );
+    }
+    Ok(path)
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers (also used by unit tests below)
 // ---------------------------------------------------------------------------
+
+/// Read the current content of a drop-in file, or `None` if it does not exist.
+///
+/// Other I/O errors are treated conservatively as "absent" to avoid exposing
+/// unrelated errors to callers (the write step will surface them if needed).
+fn read_drop_in_content(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => None,
+    }
+}
 
 fn resolve_unit_path(conn: &Connection, unit: &str) -> Result<OwnedObjectPath> {
     let manager = zbus::blocking::Proxy::new(conn, SYSTEMD_BUS, MANAGER_PATH, MANAGER_IFACE)
@@ -346,5 +512,146 @@ mod tests {
         let props = read_unit_props("systemd-journald.service").expect("read_unit_props");
         // Journald is always running; we just verify we got a valid response.
         println!("journald UnitProps: {props:?}");
+    }
+
+    // --- Phase 29: resolve_drop_in_path ---
+
+    #[test]
+    fn resolve_path_valid_service() {
+        let p = resolve_drop_in_path("foo.service").expect("valid");
+        assert_eq!(
+            p,
+            PathBuf::from("/etc/systemd/system/foo.service.d/50-syswarden.conf")
+        );
+    }
+
+    #[test]
+    fn resolve_path_valid_other_suffixes() {
+        for suffix in KNOWN_UNIT_SUFFIXES {
+            let unit = format!("test{suffix}");
+            assert!(
+                resolve_drop_in_path(&unit).is_ok(),
+                "suffix {suffix} rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_path_rejects_empty() {
+        assert!(resolve_drop_in_path("").is_err());
+    }
+
+    #[test]
+    fn resolve_path_rejects_slash() {
+        assert!(resolve_drop_in_path("foo/bar.service").is_err());
+    }
+
+    #[test]
+    fn resolve_path_rejects_dotdot() {
+        assert!(resolve_drop_in_path("../etc/shadow.service").is_err());
+    }
+
+    #[test]
+    fn resolve_path_rejects_unknown_suffix() {
+        assert!(resolve_drop_in_path("foo.exe").is_err());
+        assert!(resolve_drop_in_path("noext").is_err());
+    }
+
+    // --- Phase 29: render_drop_in ---
+
+    #[test]
+    fn render_all_fields() {
+        let props = UnitProps {
+            cpu_weight: Some(50),
+            io_weight: Some(75),
+            memory_high: Some(1024 * 1024 * 1024),
+        };
+        let s = render_drop_in(&props);
+        assert!(s.starts_with("[Service]\n"), "must start with [Service]");
+        assert!(s.contains("CPUWeight=50\n"));
+        assert!(s.contains("IOWeight=75\n"));
+        assert!(s.contains("MemoryHigh=1073741824\n"));
+        assert!(s.ends_with('\n'), "must end with newline");
+    }
+
+    #[test]
+    fn render_memory_high_u64_max_is_infinity() {
+        let props = UnitProps {
+            memory_high: Some(u64::MAX),
+            ..Default::default()
+        };
+        let s = render_drop_in(&props);
+        assert!(s.contains("MemoryHigh=infinity\n"));
+    }
+
+    #[test]
+    fn render_skips_none_fields() {
+        let props = UnitProps {
+            cpu_weight: Some(50),
+            io_weight: None,
+            memory_high: None,
+        };
+        let s = render_drop_in(&props);
+        assert!(!s.contains("IOWeight"), "IOWeight should be absent");
+        assert!(!s.contains("MemoryHigh"), "MemoryHigh should be absent");
+        assert!(s.contains("CPUWeight=50"));
+    }
+
+    #[test]
+    fn render_all_none_is_just_service_header() {
+        let s = render_drop_in(&UnitProps::default());
+        assert_eq!(s, "[Service]\n");
+    }
+
+    // --- Phase 29: DropInPriorState serde ---
+
+    #[test]
+    fn drop_in_prior_state_serde_roundtrip() {
+        let state = DropInPriorState {
+            path: PathBuf::from("/etc/systemd/system/foo.service.d/50-syswarden.conf"),
+            prior_content: Some("[Service]\nCPUWeight=100\n".to_string()),
+            written_content: "[Service]\nCPUWeight=50\n".to_string(),
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: DropInPriorState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn drop_in_prior_state_serde_none_prior() {
+        let state = DropInPriorState {
+            path: PathBuf::from("/etc/systemd/system/bar.service.d/50-syswarden.conf"),
+            prior_content: None,
+            written_content: "[Service]\nMemoryHigh=infinity\n".to_string(),
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: DropInPriorState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.prior_content, None);
+    }
+
+    // --- Phase 29: live write/remove test ---
+
+    #[test]
+    #[ignore = "requires root + running systemd; writes to /etc/systemd/system/"]
+    fn live_write_and_remove_drop_in() {
+        let unit = "systemd-journald.service";
+        let props = UnitProps {
+            cpu_weight: Some(50),
+            ..Default::default()
+        };
+        let prior = write_drop_in(unit, &props).expect("write_drop_in");
+        println!("written to {}", prior.path.display());
+        assert!(prior.path.exists(), "drop-in should exist after write");
+
+        // Restore: remove it if it was newly created.
+        if prior.prior_content.is_none() {
+            remove_drop_in(unit).expect("remove_drop_in");
+            assert!(!prior.path.exists(), "drop-in should be gone after remove");
+        } else {
+            // Rewrite the old content.
+            std::fs::write(&prior.path, prior.prior_content.as_deref().unwrap_or(""))
+                .expect("restore prior content");
+            daemon_reload().expect("daemon_reload");
+        }
     }
 }

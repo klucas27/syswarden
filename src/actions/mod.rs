@@ -757,15 +757,41 @@ fn dispatch_with_prior(
                 };
                 return Ok((result, serde_json::Value::Null, false));
             }
-            // set_unit_properties captures prior state before writing (architecture.md §5.15)
-            let prior = systemd::set_unit_properties(&unit, &new_props, true)
-                .with_context(|| format!("SetUnitProperties for {unit}"))?;
-            let prior_json =
-                serde_json::to_value(&prior).context("serialize UnitProps prior state")?;
+
+            // Persistent vs transient path (Phase 29, architecture.md §5.8 / §18).
+            // The planner sets params["persistent"]="true" for explicitly-configured
+            // service rules (Phase 32); the default path is transient (runtime=true).
+            let persistent = action.params.get("persistent").is_some_and(|v| v == "true");
+
+            let (prior_json, message) = if persistent {
+                // Persistent: write /etc/systemd/system/<unit>.d/50-syswarden.conf + reload.
+                let drop_in = systemd::write_drop_in(&unit, &new_props)
+                    .with_context(|| format!("write_drop_in for {unit}"))?;
+                let json = serde_json::json!({
+                    "backend": "persistent",
+                    "path": drop_in.path,
+                    "prior_content": drop_in.prior_content,
+                    "written_content": drop_in.written_content,
+                });
+                (json, format!("wrote persistent drop-in for {unit}"))
+            } else {
+                // Transient: set_unit_properties captures prior state before writing
+                // (architecture.md §5.15).
+                let prior = systemd::set_unit_properties(&unit, &new_props, true)
+                    .with_context(|| format!("SetUnitProperties for {unit}"))?;
+                let json = serde_json::json!({
+                    "backend": "transient",
+                    "cpu_weight": prior.cpu_weight,
+                    "io_weight": prior.io_weight,
+                    "memory_high": prior.memory_high,
+                });
+                (json, format!("applied transient resource props to {unit}"))
+            };
+
             let result = ActionResult {
                 action_id: action.id,
                 status: ActionStatus::Executed,
-                message: format!("applied resource props to {unit}"),
+                message,
                 rollback_id: None,
             };
             Ok((result, prior_json, true))

@@ -137,10 +137,14 @@ impl RollbackStore {
     /// Dispatches based on `action_kind`:
     /// - `AdjustNice`   → restore nice via `setpriority(2)`
     /// - `AdjustIonice` → restore ioprio via `ioprio_set(2)`
-    /// - `SetCpuWeight | SetIoWeight | SetMemoryHigh` → restore via `systemd::set_unit_properties`
+    /// - `SetCpuWeight | SetIoWeight | SetMemoryHigh` (backend=transient)
+    ///   → restore via `systemd::set_unit_properties` (architecture.md §5.15)
+    /// - `SetCpuWeight | SetIoWeight | SetMemoryHigh` (backend=persistent, Phase 30)
+    ///   → rewrite or remove the drop-in file, then `daemon-reload`
     ///
     /// # Errors
-    /// `id` not found; entry irreversible; empty prior state; revert syscall/D-Bus failure.
+    /// `id` not found; entry irreversible; empty prior state; revert syscall/D-Bus failure;
+    /// drop-in file changed since backup (Phase 30 integrity check).
     pub fn apply(&self, id: u64) -> Result<()> {
         let entry = self
             .entries
@@ -167,10 +171,18 @@ impl RollbackStore {
             "AdjustNice" => revert_nice(&entry.prior_state),
             "AdjustIonice" => revert_ionice(&entry.prior_state),
             "SetCpuWeight" | "SetIoWeight" | "SetMemoryHigh" => {
-                let unit = parse_unit_from_target(&entry.target).ok_or_else(|| {
-                    anyhow::anyhow!("rollback: cannot parse unit from target '{}'", entry.target)
-                })?;
-                revert_service_props(&unit, &entry.prior_state)
+                if entry.prior_state.get("backend").and_then(|v| v.as_str()) == Some("persistent") {
+                    revert_drop_in(&entry.prior_state)
+                } else {
+                    // "transient" tag or missing "backend" (backward compat with old format).
+                    let unit = parse_unit_from_target(&entry.target).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "rollback: cannot parse unit from target '{}'",
+                            entry.target
+                        )
+                    })?;
+                    revert_service_props(&unit, &entry.prior_state)
+                }
             }
             kind => bail!("rollback: no revert handler for action_kind '{kind}'"),
         }
@@ -293,16 +305,90 @@ fn revert_ionice(prior_state: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Restore systemd unit properties from `prior_state` (a serialized `UnitProps`).
+/// Restore systemd unit properties from a tagged `prior_state` (Phase 26 / Phase 29).
+///
+/// Accepts both the legacy untagged format (`{cpu_weight, io_weight, memory_high}`) and
+/// the new tagged format (`{backend: "transient", cpu_weight, ...}`).
 fn revert_service_props(unit: &str, prior_state: &serde_json::Value) -> Result<()> {
-    let prior: crate::systemd::UnitProps = serde_json::from_value(prior_state.clone())
-        .context("rollback: deserialize UnitProps from prior_state")?;
+    // Extract the UnitProps fields regardless of whether the "backend" tag is present.
+    let prior = crate::systemd::UnitProps {
+        cpu_weight: prior_state["cpu_weight"].as_u64(),
+        io_weight: prior_state["io_weight"].as_u64(),
+        memory_high: prior_state["memory_high"].as_u64(),
+    };
     if prior.is_empty() {
         return Ok(()); // nothing was set before → nothing to restore
     }
     crate::systemd::set_unit_properties(unit, &prior, true)
         .with_context(|| format!("rollback: restore properties for {unit}"))?;
     Ok(())
+}
+
+/// Revert a persistent drop-in (Phase 30, architecture.md §5.15 / §17 backup policy).
+///
+/// Reads the current file content and compares it to `written_content`. If the file has
+/// been modified externally since we wrote it, refuse to revert (integrity check).
+///
+/// - If `prior_content` is `None` (file did not exist before): removes the file.
+/// - If `prior_content` is `Some(content)`: writes the original content back.
+/// - In both cases issues `daemon-reload` via D-Bus.
+///
+/// # Errors
+/// Missing or corrupt `prior_state` fields; file changed since backup;
+/// file I/O error; D-Bus unavailable.
+fn revert_drop_in(prior_state: &serde_json::Value) -> Result<()> {
+    let path_str = prior_state["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("rollback: persistent prior_state missing 'path'"))?;
+    let written_content = prior_state["written_content"].as_str().ok_or_else(|| {
+        anyhow::anyhow!("rollback: persistent prior_state missing 'written_content'")
+    })?;
+    let prior_content = prior_state["prior_content"].as_str(); // None = file was absent
+
+    let path = std::path::Path::new(path_str);
+
+    // Integrity check: refuse if the file has been changed or deleted since we wrote it.
+    restore_drop_in_file(path, prior_content, written_content)?;
+
+    crate::systemd::daemon_reload().context("rollback: daemon-reload after drop-in revert")
+}
+
+/// Restore the drop-in file on disk (no D-Bus; separated for unit-test coverage).
+///
+/// Returns `Err` if the current on-disk content differs from `written_content` (external
+/// modification) or if the file is missing when `prior_content.is_some()`.
+pub(crate) fn restore_drop_in_file(
+    path: &std::path::Path,
+    prior_content: Option<&str>,
+    written_content: &str,
+) -> Result<()> {
+    match fs::read_to_string(path) {
+        Ok(current) if current == written_content => {
+            // File is intact — proceed with restoration.
+            if let Some(original) = prior_content {
+                // Restore original content.
+                fs::write(path, original)
+                    .with_context(|| format!("rollback: restore drop-in {}", path.display()))?;
+            } else {
+                // File was created by syswarden — remove it.
+                fs::remove_file(path)
+                    .with_context(|| format!("rollback: remove drop-in {}", path.display()))?;
+            }
+            Ok(())
+        }
+        Ok(_current) => bail!(
+            "rollback: drop-in {} has been modified since backup — refusing to revert",
+            path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // File is gone — treat as "changed" (someone deleted it).
+            bail!(
+                "rollback: drop-in {} is missing (deleted since backup) — refusing to revert",
+                path.display()
+            )
+        }
+        Err(e) => Err(e).with_context(|| format!("rollback: read drop-in {}", path.display())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +498,123 @@ mod tests {
         // Non-existent id also fails.
         let err2 = store.apply(u64::MAX).unwrap_err();
         assert!(err2.to_string().contains("no entry with id="));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Phase 30: restore_drop_in_file (file-ops only, no D-Bus) ---
+
+    #[test]
+    fn restore_drop_in_file_removes_when_prior_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("50-syswarden.conf");
+        let written = "[Service]\nCPUWeight=50\n";
+        fs::write(&path, written).expect("write");
+
+        restore_drop_in_file(&path, None, written).expect("restore");
+        assert!(!path.exists(), "file should be removed");
+    }
+
+    #[test]
+    fn restore_drop_in_file_restores_prior_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("50-syswarden.conf");
+        let written = "[Service]\nCPUWeight=50\n";
+        let original = "[Service]\nCPUWeight=100\n";
+        fs::write(&path, written).expect("write");
+
+        restore_drop_in_file(&path, Some(original), written).expect("restore");
+        let current = fs::read_to_string(&path).expect("read");
+        assert_eq!(current, original, "prior content should be restored");
+    }
+
+    #[test]
+    fn restore_drop_in_file_refuses_when_file_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("50-syswarden.conf");
+        let written = "[Service]\nCPUWeight=50\n";
+        // Simulate external modification.
+        fs::write(&path, "[Service]\nCPUWeight=999\n").expect("write");
+
+        let err = restore_drop_in_file(&path, None, written).unwrap_err();
+        assert!(
+            err.to_string().contains("modified since backup"),
+            "expected tamper refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn restore_drop_in_file_refuses_when_file_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("50-syswarden.conf");
+        // File was never written — simulate it being deleted after backup.
+        let err = restore_drop_in_file(&path, Some("old content"), "[Service]\nCPUWeight=50\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("missing"),
+            "expected missing-file refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rollback_apply_routes_persistent_to_revert_drop_in() {
+        let (mut store, dir) = temp_store("persistent_route");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let drop_in_path = tmp.path().join("50-syswarden.conf");
+        let written = "[Service]\nCPUWeight=50\n";
+        fs::write(&drop_in_path, written).expect("write");
+
+        // Build a rollback entry with persistent prior state pointing to our temp file.
+        let prior_state = serde_json::json!({
+            "backend": "persistent",
+            "path": drop_in_path.to_str().unwrap(),
+            "prior_content": null,
+            "written_content": written,
+        });
+        let entry = RollbackEntry::new("SetCpuWeight", "unit=foo.service", true)
+            .with_prior_state(prior_state);
+        let id = entry.id;
+        store.record(entry);
+
+        // Calling apply will call revert_drop_in → restore_drop_in_file + daemon_reload.
+        // daemon_reload will fail (no D-Bus in tests), but the file should be gone first.
+        // We verify file removal happened before the daemon_reload error.
+        let result = store.apply(id);
+        // File should have been removed (prior_content=null) before daemon_reload attempt.
+        assert!(
+            !drop_in_path.exists(),
+            "file should be removed even if daemon_reload fails"
+        );
+        // Error from daemon_reload is expected in test env.
+        drop(result);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_apply_routes_transient_by_backend_tag() {
+        // Verify the "backend":"transient" tag is handled without panicking.
+        // (Actual D-Bus call would fail; we test the routing logic stops at the right error.)
+        let (mut store, dir) = temp_store("transient_route");
+        let prior_state = serde_json::json!({
+            "backend": "transient",
+            "cpu_weight": 100u64,
+            "io_weight": null,
+            "memory_high": null,
+        });
+        let entry = RollbackEntry::new("SetCpuWeight", "unit=foo.service", true)
+            .with_prior_state(prior_state);
+        let id = entry.id;
+        store.record(entry);
+
+        // Will fail at D-Bus, but must not fail at routing/parse.
+        let err = store.apply(id).unwrap_err();
+        let msg = err.to_string();
+        // Error must come from D-Bus / systemd, not from "no revert handler".
+        assert!(
+            !msg.contains("no revert handler"),
+            "unexpected routing error: {msg}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
