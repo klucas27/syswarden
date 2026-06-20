@@ -33,6 +33,7 @@ const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 const PROP_CPU_WEIGHT: &str = "CPUWeight";
 const PROP_IO_WEIGHT: &str = "IOWeight";
 const PROP_MEMORY_HIGH: &str = "MemoryHigh";
+const PROP_MEMORY_MAX: &str = "MemoryMax";
 
 // Drop-in file constants (Phase 29, architecture.md §5.8).
 const DROPIN_DIR_BASE: &str = "/etc/systemd/system";
@@ -73,8 +74,8 @@ pub struct DropInPriorState {
 /// - When *reading* (prior-state capture): `Some(v)` is the live D-Bus value; `None`
 ///   means the property was absent from the response.
 ///
-/// `MemoryHigh = u64::MAX` is systemd's representation of "unlimited". We preserve it
-/// as-is so rollback can restore the unlimited state accurately, unlike the `cgroups`
+/// `MemoryHigh`/`MemoryMax = u64::MAX` is systemd's representation of "unlimited". We preserve
+/// it as-is so rollback can restore the unlimited state accurately, unlike the `cgroups`
 /// module which normalises it to `None` for display purposes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitProps {
@@ -84,13 +85,18 @@ pub struct UnitProps {
     pub io_weight: Option<u64>,
     /// `MemoryHigh` in bytes. `u64::MAX` = unlimited (systemd's sentinel). `None` = skip.
     pub memory_high: Option<u64>,
+    /// `MemoryMax` in bytes. `u64::MAX` = unlimited. `None` = skip (Phase 33).
+    pub memory_max: Option<u64>,
 }
 
 impl UnitProps {
     /// `true` when all fields are `None` — nothing to write to systemd.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.cpu_weight.is_none() && self.io_weight.is_none() && self.memory_high.is_none()
+        self.cpu_weight.is_none()
+            && self.io_weight.is_none()
+            && self.memory_high.is_none()
+            && self.memory_max.is_none()
     }
 }
 
@@ -235,6 +241,13 @@ pub fn render_drop_in(props: &UnitProps) -> String {
             lines.push(format!("MemoryHigh={h}"));
         }
     }
+    if let Some(m) = props.memory_max {
+        if m == u64::MAX {
+            lines.push("MemoryMax=infinity".to_string());
+        } else {
+            lines.push(format!("MemoryMax={m}"));
+        }
+    }
     lines.push(String::new()); // trailing newline
     lines.join("\n")
 }
@@ -313,6 +326,7 @@ fn unit_props_from_map(map: &HashMap<String, OwnedValue>) -> UnitProps {
         cpu_weight: extract_u64(map, PROP_CPU_WEIGHT),
         io_weight: extract_u64(map, PROP_IO_WEIGHT),
         memory_high: extract_u64(map, PROP_MEMORY_HIGH),
+        memory_max: extract_u64(map, PROP_MEMORY_MAX),
     }
 }
 
@@ -341,6 +355,12 @@ fn build_dbus_props(props: &UnitProps) -> Result<Vec<(String, OwnedValue)>> {
         out.push((
             PROP_MEMORY_HIGH.to_string(),
             OwnedValue::try_from(Value::from(h)).context("encode MemoryHigh")?,
+        ));
+    }
+    if let Some(m) = props.memory_max {
+        out.push((
+            PROP_MEMORY_MAX.to_string(),
+            OwnedValue::try_from(Value::from(m)).context("encode MemoryMax")?,
         ));
     }
     Ok(out)
@@ -374,6 +394,7 @@ mod tests {
             cpu_weight: Some(50),
             io_weight: Some(75),
             memory_high: Some(4 * 1024 * 1024 * 1024),
+            memory_max: Some(8 * 1024 * 1024 * 1024),
         };
         let json = serde_json::to_string(&props).expect("serialize");
         let back: UnitProps = serde_json::from_str(&json).expect("deserialize");
@@ -386,6 +407,7 @@ mod tests {
             cpu_weight: None,
             io_weight: Some(50),
             memory_high: None,
+            memory_max: None,
         };
         let json = serde_json::to_string(&props).expect("serialize");
         let back: UnitProps = serde_json::from_str(&json).expect("deserialize");
@@ -447,6 +469,7 @@ mod tests {
             cpu_weight: Some(50),
             io_weight: None,
             memory_high: None,
+            memory_max: None,
         };
         let dbus = build_dbus_props(&props).expect("build");
         assert_eq!(dbus.len(), 1);
@@ -459,13 +482,15 @@ mod tests {
             cpu_weight: Some(50),
             io_weight: Some(75),
             memory_high: Some(4 * 1024 * 1024 * 1024),
+            memory_max: Some(8 * 1024 * 1024 * 1024),
         };
         let dbus = build_dbus_props(&props).expect("build");
-        assert_eq!(dbus.len(), 3);
+        assert_eq!(dbus.len(), 4);
         let names: Vec<&str> = dbus.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&PROP_CPU_WEIGHT));
         assert!(names.contains(&PROP_IO_WEIGHT));
         assert!(names.contains(&PROP_MEMORY_HIGH));
+        assert!(names.contains(&PROP_MEMORY_MAX));
     }
 
     #[test]
@@ -565,12 +590,14 @@ mod tests {
             cpu_weight: Some(50),
             io_weight: Some(75),
             memory_high: Some(1024 * 1024 * 1024),
+            memory_max: Some(2 * 1024 * 1024 * 1024),
         };
         let s = render_drop_in(&props);
         assert!(s.starts_with("[Service]\n"), "must start with [Service]");
         assert!(s.contains("CPUWeight=50\n"));
         assert!(s.contains("IOWeight=75\n"));
         assert!(s.contains("MemoryHigh=1073741824\n"));
+        assert!(s.contains("MemoryMax=2147483648\n"));
         assert!(s.ends_with('\n'), "must end with newline");
     }
 
@@ -590,6 +617,7 @@ mod tests {
             cpu_weight: Some(50),
             io_weight: None,
             memory_high: None,
+            memory_max: None,
         };
         let s = render_drop_in(&props);
         assert!(!s.contains("IOWeight"), "IOWeight should be absent");

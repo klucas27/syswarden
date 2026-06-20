@@ -170,7 +170,7 @@ impl RollbackStore {
         match entry.action_kind.as_str() {
             "AdjustNice" => revert_nice(&entry.prior_state),
             "AdjustIonice" => revert_ionice(&entry.prior_state),
-            "SetCpuWeight" | "SetIoWeight" | "SetMemoryHigh" => {
+            "SetCpuWeight" | "SetIoWeight" | "SetMemoryHigh" | "SetMemoryMax" => {
                 if entry.prior_state.get("backend").and_then(|v| v.as_str()) == Some("persistent") {
                     revert_drop_in(&entry.prior_state)
                 } else {
@@ -315,6 +315,7 @@ fn revert_service_props(unit: &str, prior_state: &serde_json::Value) -> Result<(
         cpu_weight: prior_state["cpu_weight"].as_u64(),
         io_weight: prior_state["io_weight"].as_u64(),
         memory_high: prior_state["memory_high"].as_u64(),
+        memory_max: prior_state["memory_max"].as_u64(),
     };
     if prior.is_empty() {
         return Ok(()); // nothing was set before → nothing to restore
