@@ -119,6 +119,32 @@ impl HistoryStore {
         self.push_to_buf(record);
     }
 
+    /// Load all records with `timestamp >= since`, oldest first, read fresh from disk.
+    ///
+    /// Unlike [`Self::recent_levels`] (capped in-memory ring buffer), this spans
+    /// every daily file in the window so multi-day reports are accurate. Corrupt
+    /// lines are skipped with a `warn!`. Used by the `reports` aggregation layer
+    /// (architecture.md §5.19).
+    #[must_use]
+    pub fn records_since(&self, since: DateTime<Utc>) -> Vec<HistoryRecord> {
+        let cutoff_date = since.date_naive();
+        let mut files: Vec<(NaiveDate, PathBuf)> = Self::history_files(&self.dir)
+            .into_iter()
+            .filter(|(date, _)| *date >= cutoff_date)
+            .collect();
+        files.sort_by_key(|(date, _)| *date);
+
+        let mut out = Vec::new();
+        for (_, path) in files {
+            for rec in Self::read_records_file(&path) {
+                if rec.timestamp >= since {
+                    out.push(rec);
+                }
+            }
+        }
+        out
+    }
+
     /// Return the last `n` pressure levels (oldest first) for hysteresis trend seeding.
     #[must_use]
     pub fn recent_levels(&self, n: usize) -> Vec<PressureLevel> {
@@ -162,14 +188,22 @@ impl HistoryStore {
         let Some(path) = self.latest_file() else {
             return;
         };
-        let content = match fs::read_to_string(&path) {
+        let records = Self::read_records_file(&path);
+        let start = records.len().saturating_sub(RECENT_BUF_CAP);
+        self.recent_buf = records[start..].to_vec();
+    }
+
+    /// Read and parse every record from one JSONL file, oldest first.
+    /// Corrupt or empty lines are skipped with a `warn!`; never panics.
+    fn read_records_file(path: &Path) -> Vec<HistoryRecord> {
+        let content = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
                 warn!("history: cannot read {path:?}: {e}");
-                return;
+                return Vec::new();
             }
         };
-        let records: Vec<HistoryRecord> = content
+        content
             .lines()
             .filter_map(|line| {
                 if line.trim().is_empty() {
@@ -179,10 +213,7 @@ impl HistoryStore {
                     .map_err(|e| warn!("history: corrupt line in {path:?}: {e}"))
                     .ok()
             })
-            .collect();
-
-        let start = records.len().saturating_sub(RECENT_BUF_CAP);
-        self.recent_buf = records[start..].to_vec();
+            .collect()
     }
 
     /// Return the path of the most recently dated history file in the store dir.

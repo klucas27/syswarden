@@ -963,14 +963,15 @@ Conceptual definitions. Implementers must keep these names and field meanings. T
 - **Fail-safe behavior** — On any uncertainty, error, or invalid config: fail closed (block actions, enter `protected_mode`/`degraded`), never fail open.
 - **Error handling philosophy** — Libraries return typed errors (`thiserror`); the daemon converts them to logged, recoverable outcomes (`anyhow` context) and continues. No `unwrap`/`expect` on runtime paths.
 - **Command execution restrictions** — No shell interpolation. External tools (if ever used as fallback) are invoked with explicit argument vectors, never through a shell, never with config-derived strings as code.
-- **No network policy** — syswarden opens no sockets and makes no outbound connections. This is an invariant; the daemon does not link networking crates.
+- **No network policy** — syswarden opens no network sockets and makes no outbound connections. This is an invariant; the daemon links no networking crates. The invariant targets *networking* only. Two local `AF_UNIX` uses are explicitly permitted and are **not** "network": (1) systemd D-Bus for read/write of unit properties, and (2) the systemd readiness/watchdog protocol via `$NOTIFY_SOCKET` (`sd_notify`: `READY=1`, `WATCHDOG=1`). The watchdog datagram is sent with `std` (`UnixDatagram`) only — no `libsystemd`, no networking crate. The unit's `RestrictAddressFamilies=AF_UNIX` and `IPAddressDeny=any` enforce this boundary at the kernel level.
 - **No shell injection policy** — Config values are data, never executed. There is no "run this command" config field.
 
 ---
 
 ## 18. systemd Integration
 
-- **Daemon service file design** — `packaging/systemd/syswarden.service`, `Type=simple`, `ExecStart=/usr/bin/syswarden daemon`, `Restart=on-failure`, `RestartSec=5`.
+- **Daemon service file design** — `packaging/systemd/syswarden.service`, `Type=notify`, `ExecStart=/usr/bin/syswarden daemon`, `Restart=on-failure`, `RestartSec=5`.
+- **Liveness / watchdog** — `Type=notify`: the daemon sends `READY=1` once initialization completes (capabilities detected, stores opened, signal handlers installed). With `WatchdogSec` set, the daemon pings `WATCHDOG=1` from inside the supervision loop after each completed tick (never from a side task — a hung loop must stop pinging). `WatchdogSec` is kept comfortably above the maximum adaptive poll interval to avoid false positives on long healthy sleeps; `Restart=on-watchdog` restarts a wedged daemon. Implemented with `std` `UnixDatagram` on `$NOTIFY_SOCKET` only (§17 "No network policy" exception); missing socket ⇒ silent no-op (foreground/non-systemd runs).
 - **Service hardening** — `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `ProtectKernelTunables=yes` (relaxed only if/when sysctl apply is explicitly enabled), `ProtectControlGroups=no` (needs cgroup access to govern), `RestrictAddressFamilies=AF_UNIX` (D-Bus only, no network), `IPAddressDeny=any`, `SystemCallFilter=@system-service`, `MemoryDenyWriteExecute=yes`, `ReadWritePaths=/var/lib/syswarden`.
 - **Restart behavior** — Restart on failure with backoff; do not restart-loop aggressively (`StartLimitIntervalSec`/`StartLimitBurst`).
 - **Logging to journald** — Log to stderr; journald captures it. `journald = true` keeps audit JSONL in addition for structured history.

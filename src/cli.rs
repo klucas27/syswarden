@@ -9,11 +9,13 @@ use clap::{Parser, Subcommand};
 
 use crate::actions;
 use crate::config::{self, AppConfig};
+use crate::history::HistoryStore;
 use crate::metrics::{self, CpuSample};
 use crate::policy;
 use crate::pressure;
 use crate::processes;
 use crate::profiles;
+use crate::reports;
 use crate::rollback::RollbackStore;
 use crate::safety::Capabilities;
 use crate::services;
@@ -242,8 +244,8 @@ pub fn dispatch(cli: &Cli, config: &AppConfig) -> ExitCode {
         Command::Config { cmd } => dispatch_config(cmd, config, cli.json),
         Command::Actions { cmd } => dispatch_actions(cmd, cli, config),
         Command::Zram { cmd } => dispatch_zram(cmd),
-        Command::Rollback { cmd } => dispatch_rollback(cmd, config),
-        Command::Report { .. } => run_stub("report"),
+        Command::Rollback { cmd } => dispatch_rollback(cmd, cli, config),
+        Command::Report { days } => dispatch_report(cli, config, *days),
         Command::Version => {
             println!("syswarden {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -1027,7 +1029,7 @@ fn dispatch_zram(cmd: &ZramCommand) -> ExitCode {
 }
 
 #[must_use]
-fn dispatch_rollback(cmd: &RollbackCommand, config: &AppConfig) -> ExitCode {
+fn dispatch_rollback(cmd: &RollbackCommand, cli: &Cli, config: &AppConfig) -> ExitCode {
     match cmd {
         RollbackCommand::List => {
             let store = match RollbackStore::open(config) {
@@ -1038,6 +1040,13 @@ fn dispatch_rollback(cmd: &RollbackCommand, config: &AppConfig) -> ExitCode {
                 }
             };
             let entries = store.list();
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&entries).unwrap_or_default()
+                );
+                return ExitCode::SUCCESS;
+            }
             if entries.is_empty() {
                 println!("No rollback entries.");
             } else {
@@ -1071,6 +1080,58 @@ fn dispatch_rollback(cmd: &RollbackCommand, config: &AppConfig) -> ExitCode {
             }
         }
     }
+}
+
+/// `syswarden report --days N`: aggregate local history over a window (architecture.md §5.19, §13).
+fn dispatch_report(cli: &Cli, config: &AppConfig, days: u32) -> ExitCode {
+    let store = match HistoryStore::open(config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("report: cannot open history store: {e:#}");
+            return ExitCode::from(exit_codes::RUNTIME_ERROR);
+        }
+    };
+    let since = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
+    let records = store.records_since(since);
+    let rpt = reports::report(&records, days, since);
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&rpt).unwrap_or_default());
+        return ExitCode::SUCCESS;
+    }
+
+    println!("Report — last {days} day(s)");
+    println!("  ticks recorded: {}", rpt.record_count);
+    if rpt.record_count == 0 {
+        println!("  (no history in window)");
+        return ExitCode::SUCCESS;
+    }
+    if let (Some(first), Some(last)) = (rpt.first_timestamp, rpt.last_timestamp) {
+        println!(
+            "  span:           {} → {}",
+            first.format("%Y-%m-%dT%H:%M:%SZ"),
+            last.format("%Y-%m-%dT%H:%M:%SZ"),
+        );
+    }
+    let c = &rpt.level_counts;
+    println!(
+        "  pressure:       none={} low={} moderate={} high={} critical={}",
+        c.none, c.low, c.moderate, c.high, c.critical,
+    );
+    if let Some(level) = rpt.dominant_level {
+        println!("  dominant level: {level:?}");
+    }
+    println!(
+        "  actions:        {} planned ({} simulated), {} blocked",
+        rpt.total_actions, rpt.total_simulated, rpt.total_blocked,
+    );
+    if !rpt.outcome_counts.is_empty() {
+        println!("  outcomes:");
+        for (outcome, n) in &rpt.outcome_counts {
+            println!("    {n:>5}  {outcome}");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 #[must_use]

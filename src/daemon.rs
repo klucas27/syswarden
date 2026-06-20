@@ -199,6 +199,9 @@ pub fn run(config: AppConfig) -> Result<()> {
 // Private: async daemon loop
 // ---------------------------------------------------------------------------
 
+// One cohesive supervision loop (architecture.md §6); splitting it would obscure
+// the lifecycle. Watchdog/signal handling adds length, not separable concerns.
+#[allow(clippy::too_many_lines)]
 async fn run_async(config: AppConfig) -> Result<()> {
     let caps = Capabilities::detect();
     let profile = profiles::resolve(&config.global.profile, &config);
@@ -225,6 +228,16 @@ async fn run_async(config: AppConfig) -> Result<()> {
         use tokio::signal::unix::{signal, SignalKind};
         signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?
     };
+
+    // Signal readiness to systemd (Type=notify); no-op outside systemd.
+    // Sent after init completes: caps detected, stores opened, signals installed.
+    sd_notify("READY=1");
+    // Watchdog ping budget = half the systemd period (sd_watchdog convention).
+    // `None` when no watchdog is configured.
+    let watchdog_budget = watchdog_period().map(|p| p / 2);
+    if watchdog_budget.is_some() {
+        info!("systemd watchdog active");
+    }
 
     loop {
         let tick_start = Instant::now();
@@ -263,6 +276,12 @@ async fn run_async(config: AppConfig) -> Result<()> {
             pressure_trend.remove(0);
         }
 
+        // Watchdog liveness ping — only after a completed tick, so a wedged tick
+        // stops pinging and systemd restarts us (architecture.md §18).
+        if watchdog_budget.is_some() {
+            sd_notify("WATCHDOG=1");
+        }
+
         debug!(
             state = ?tick.state,
             actions = tick.results.len(),
@@ -273,7 +292,11 @@ async fn run_async(config: AppConfig) -> Result<()> {
         // Step 16: adaptive sleep, interrupted by SIGTERM or SIGINT.
         let interval = adaptive_interval(tick.state, &profile, &config);
         let elapsed = tick_start.elapsed();
-        let sleep_dur = interval.saturating_sub(elapsed);
+        let mut sleep_dur = interval.saturating_sub(elapsed);
+        // Never sleep past the watchdog budget, or we would miss a ping.
+        if let Some(budget) = watchdog_budget {
+            sleep_dur = sleep_dur.min(budget);
+        }
 
         // Signal futures are re-polled each iteration.
         #[cfg(unix)]
@@ -309,6 +332,94 @@ async fn run_async(config: AppConfig) -> Result<()> {
     // Step 17: graceful shutdown — flush is a no-op in Phase 14 (in-memory history).
     info!("syswarden daemon stopped");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// systemd readiness / watchdog (sd_notify)
+// ---------------------------------------------------------------------------
+//
+// Implements the systemd notify protocol over the local `$NOTIFY_SOCKET`
+// (`AF_UNIX` datagram) with `std` only — no `libsystemd`, no networking crate.
+// This is the explicit `AF_UNIX` exception to the no-network invariant
+// (architecture.md §17 "No network policy", §18 "Liveness / watchdog").
+//
+// Missing `$NOTIFY_SOCKET` ⇒ silent no-op, so foreground / non-systemd runs are
+// unaffected. Send failures `warn!` and never crash the daemon (planning.md §6).
+
+/// Send one systemd notify message (e.g. `"READY=1"`, `"WATCHDOG=1"`).
+/// No-op when not started under `Type=notify`.
+#[cfg(unix)]
+fn sd_notify(message: &str) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixDatagram;
+
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return; // not under Type=notify
+    };
+    let dgram = match UnixDatagram::unbound() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("sd_notify: cannot create datagram socket: {e}");
+            return;
+        }
+    };
+    let bytes = socket.as_bytes();
+    if bytes.first() == Some(&b'@') {
+        // Leading '@' denotes the Linux abstract namespace (NUL-prefixed name).
+        send_abstract(&dgram, &bytes[1..], message.as_bytes());
+    } else if let Err(e) = dgram.send_to(message.as_bytes(), &socket) {
+        warn!("sd_notify: send to {socket:?} failed: {e}");
+    }
+}
+
+/// Send to an abstract-namespace notify socket (Linux only).
+#[cfg(target_os = "linux")]
+fn send_abstract(dgram: &std::os::unix::net::UnixDatagram, name: &[u8], msg: &[u8]) {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::SocketAddr;
+
+    match SocketAddr::from_abstract_name(name) {
+        Ok(addr) => {
+            if let Err(e) = dgram.send_to_addr(msg, &addr) {
+                warn!("sd_notify: send to abstract socket failed: {e}");
+            }
+        }
+        Err(e) => warn!("sd_notify: bad abstract socket name: {e}"),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn send_abstract(_dgram: &std::os::unix::net::UnixDatagram, _name: &[u8], _msg: &[u8]) {
+    warn!("sd_notify: abstract NOTIFY_SOCKET is unsupported on this platform");
+}
+
+#[cfg(not(unix))]
+fn sd_notify(_message: &str) {}
+
+/// Parse a `WATCHDOG_USEC` value into a watchdog period, honoring the
+/// `WATCHDOG_PID` guard. Returns `None` when the watchdog is disabled, the
+/// value is missing/zero/unparseable, or the pid guard does not match.
+///
+/// Pure (env read happens in [`watchdog_period`]) so it is deterministic to test.
+fn parse_watchdog_usec(usec: Option<&str>, pid_matches: bool) -> Option<Duration> {
+    if !pid_matches {
+        return None;
+    }
+    let usec: u64 = usec?.trim().parse().ok()?;
+    if usec == 0 {
+        return None;
+    }
+    Some(Duration::from_micros(usec))
+}
+
+/// Read the systemd watchdog period from the environment, or `None` if disabled.
+fn watchdog_period() -> Option<Duration> {
+    // If systemd set WATCHDOG_PID it must equal our pid; absent ⇒ no guard.
+    let pid_matches = match std::env::var("WATCHDOG_PID") {
+        Ok(p) => p.trim().parse::<u32>().ok() == Some(std::process::id()),
+        Err(_) => true,
+    };
+    parse_watchdog_usec(std::env::var("WATCHDOG_USEC").ok().as_deref(), pid_matches)
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +527,24 @@ mod tests {
         let profile = profiles::resolve(&config.global.profile, &config);
         let dur = adaptive_interval(SystemState::CriticalPressure, &profile, &config);
         assert!(dur.as_secs() >= 60);
+    }
+
+    #[test]
+    fn watchdog_usec_parses_microseconds() {
+        let d = parse_watchdog_usec(Some("30000000"), true).expect("some");
+        assert_eq!(d, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn watchdog_usec_disabled_when_pid_mismatch() {
+        assert_eq!(parse_watchdog_usec(Some("30000000"), false), None);
+    }
+
+    #[test]
+    fn watchdog_usec_none_on_absent_zero_or_garbage() {
+        assert_eq!(parse_watchdog_usec(None, true), None);
+        assert_eq!(parse_watchdog_usec(Some("0"), true), None);
+        assert_eq!(parse_watchdog_usec(Some("not-a-number"), true), None);
     }
 
     #[test]

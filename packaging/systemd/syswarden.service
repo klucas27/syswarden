@@ -20,12 +20,22 @@ Description=syswarden system supervision daemon
 Documentation=https://github.com/kresley/syswarden
 After=local-fs.target
 Wants=local-fs.target
+# Bound restart storms (architecture.md §18).
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/syswarden daemon
+# on-failure also covers watchdog timeout, so a hung supervision loop restarts too.
 Restart=on-failure
 RestartSec=5
+
+# Liveness watchdog: the daemon pings WATCHDOG=1 after each completed tick via
+# sd_notify ($NOTIFY_SOCKET, AF_UNIX — architecture.md §17/§18). Keep this well
+# above the maximum adaptive poll interval to avoid false positives on long
+# healthy sleeps; the daemon caps its own sleep to WatchdogSec/2 as a safety net.
+WatchdogSec=180
 
 # State directories — created automatically by systemd (mode 0750, owned by root).
 StateDirectory=syswarden
@@ -39,7 +49,7 @@ PrivateTmp=yes
 ProtectKernelTunables=yes
 # cgroup access is required to read/govern resource control — must not restrict.
 ProtectControlGroups=no
-# D-Bus only; no network sockets of any kind.
+# D-Bus and sd_notify only; no network sockets of any kind.
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
 SystemCallFilter=@system-service
