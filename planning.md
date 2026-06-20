@@ -574,8 +574,8 @@ Hand off after each phase with: a list of changed files, the checks run and thei
 
 ## 18. Version 0.3 Plan — systemd/cgroup Maturity + Gated Aggressive Actions
 
-> **Status:** v0.3 complete (Phases 29–36). Version bumped to 0.3.0. Dev gate green — 335 tests pass.
-> **Same rules apply:** follow `architecture.md`, implement strictly one phase at a time in order, report changed files, run the dev gate. **Owner-approved architecture deltas for v0.3 only:** new `sysctl` module (architecture.md §5.20 + tree §14) and the reconciled v0.3 roadmap line (§23). No other architecture changes.
+> **Status:** v0.3 complete (Phases 29–36). Version bumped to 0.3.0. Dev gate green — 388 tests pass (9 live `#[ignore]`).
+> **Same rules apply:** follow `architecture.md`, implement strictly one phase at a time in order, report changed files, run the dev gate. **Owner-approved architecture deltas for v0.3 only:** new `sysctl` module (architecture.md §5.20 + tree §14), the reconciled v0.3 roadmap line (§23), and the profile activation tooling + activation-time first-cleanup carve-out (architecture.md §17.1, §14; see §18.6 below). No other architecture changes.
 
 ### 18.1 Scope (architecture.md §10 "Aggressive actions", §23, §5.8/§5.9/§5.20)
 
@@ -619,7 +619,8 @@ Hand off after each phase with: a list of changed files, the checks run and thei
 - Do not implement `SetMemoryMax` before its "after `MemoryHigh` tried" guard is in place (Phase 33 depends on the v0.2 `MemoryHigh` path).
 - Do not implement `ApplySysctl` before backup + rollback for it exist (within Phase 35) — never write `/proc/sys` without a recorded prior value.
 - Do not implement persistent drop-ins (Phase 29) without their backup/rollback (Phase 30) landing in the same version.
-- Do not implement zram/zswap apply (v0.4), process killing, package removal, cache dropping, or any network — ever.
+- Do not implement zram/zswap apply (v0.4), or any network — ever.
+- **Daemon** must never kill processes, drop caches, or remove packages — ever. (The owner-approved *activation-script* first cleanup of architecture.md §17.1 is operator tooling outside the daemon; it does not relax this rule for any daemon/policy/actions code path.)
 
 ### 18.5 Definition of done (v0.3)
 
@@ -627,3 +628,24 @@ Hand off after each phase with: a list of changed files, the checks run and thei
 - With `dry_run = true` (default): zero system changes — identical to v0.1/v0.2 defaults.
 - With opt-in (`dry_run=false` + Aggressive-permitting profile + `allow_aggressive_actions` + allowlist; `+ allow_sysctl_apply` for sysctl): persistent drop-ins, `MemoryMax`, allowlisted restart/stop, and `sysctl` apply work, are audited, and each is reversible via `rollback apply <id>`.
 - Protected sets, non-root blocking, and fail-closed defaults still hold; zram/zswap apply remains deferred to v0.4; no prohibited or never-allowed action is executable.
+
+### 18.6 Profile activation tooling (`scripts/profiles/`)
+
+Owner-requested one-command installers, one per profile (`activate-<profile>.sh`) plus a shared `_bootstrap.sh`. Running `sudo ./scripts/profiles/activate-<profile>.sh` performs the full lifecycle end to end:
+
+1. **Install Rust** (rustup) if `cargo` is missing — built as the invoking user.
+2. **Build** `--release --locked` and **install** the binary, the systemd unit, and `/var/lib/syswarden/{history,audit,rollback}`.
+3. **Write** `/etc/syswarden/config.toml` for that profile (validated keys only; `dry_run`/gates set per profile).
+4. **Enable at boot + start** the service (`systemctl enable --now`).
+5. **First cleanup** (architecture.md §17.1) — interactive, confirmed, self-protecting memory + process reclaim. Skipped for `conservative`.
+
+Profiles & gates:
+
+| Profile | dry_run | aggressive | zram* | sysctl | first cleanup |
+|---|---|---|---|---|---|
+| conservative | true | – | – | – | skipped |
+| balanced / desktop / developer / server | false | false | – | – | yes |
+| low_ram | false | false | true* | – | yes |
+| performance | false | true | true* | opt-in | yes |
+
+\* `allow_zram_apply` is set ahead of time on low_ram/performance but is **inert** until zram apply ships in v0.4. Tuning knobs: `SYSWARDEN_ASSUME_YES=1` (non-interactive), `SYSWARDEN_CLEAN_RSS_MB` (process-cleanup RSS threshold, default 300).

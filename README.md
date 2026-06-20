@@ -64,6 +64,30 @@ sudo install -Dm644 packaging/systemd/syswarden.service \
     /etc/systemd/system/syswarden.service
 ```
 
+### One-command profile activation
+
+`scripts/profiles/activate-<profile>.sh` does the whole lifecycle in one go:
+installs Rust if needed, builds + installs the binary and unit, writes
+`/etc/syswarden/config.toml` for the profile, enables the service **at boot**,
+and runs a first cleanup.
+
+```sh
+git clone https://github.com/kresley/syswarden
+cd syswarden
+sudo ./scripts/profiles/activate-balanced.sh
+# profiles: conservative | balanced | performance | low_ram | desktop | server | developer
+```
+
+> **First cleanup** (every profile except `conservative`): after the service is
+> up, the script offers a one-time, **interactively confirmed** reclaim — drop
+> caches + graceful `SIGTERM` to heavy *user* processes. It is safe by
+> construction and **never** touches the kernel, system/root processes
+> (`uid < 1000`), `syswarden`, `sshd`, or your login/desktop session, so the
+> system stays up (architecture.md §17.1). It is skipped on non-interactive
+> shells unless `SYSWARDEN_ASSUME_YES=1`; tune the process threshold with
+> `SYSWARDEN_CLEAN_RSS_MB` (default 300). The daemon itself never kills or drops
+> caches — this is operator tooling only.
+
 ---
 
 ## Quick start
@@ -120,9 +144,16 @@ effective config and `syswarden config validate` to check for issues.
 
 | Profile | Risk tolerance | Typical use |
 |---|---|---|
-| `conservative` | Low — recommend only | Default; safe for any system |
+| `conservative` | Low — recommend only (`dry_run`) | Default; safe for any system |
 | `balanced` | Moderate — `CPUWeight`, `IOWeight`, `MemoryHigh`, `nice`/`ionice` | Desktop / workstation |
-| `performance` | Higher — all moderate + `MemoryMax`, restart | Servers (read docs first) |
+| `desktop` | Moderate — `nice`, `CPUWeight`, `MemoryHigh` | Interactive desktop |
+| `developer` | Moderate — adds `ionice`, `IOWeight` | Dev box / heavy I/O |
+| `server` | Moderate — `CPUWeight`, `IOWeight`, `MemoryHigh` | Headless servers |
+| `low_ram` | Moderate — `nice`/`ionice`, `MemoryHigh` (+ zram in v0.4) | Low-memory machines |
+| `performance` | Aggressive — all moderate + `MemoryMax`, restart | Servers (read docs first) |
+
+Each profile has a one-command installer under `scripts/profiles/` — see
+[One-command profile activation](#one-command-profile-activation).
 
 ---
 

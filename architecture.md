@@ -887,6 +887,12 @@ syswarden/
 ├── docs/
 │   ├── usage.md
 │   └── adr/
+├── scripts/
+│   ├── setup-root.sh
+│   ├── test-live.sh
+│   └── profiles/                    # one-command install + activate per profile (§17.1)
+│       ├── _bootstrap.sh            # shared: install/build, enable at boot, first_cleanup
+│       └── activate-<profile>.sh    # conservative|balanced|performance|low_ram|desktop|server|developer
 ├── packaging/
 │   ├── systemd/
 │   │   └── syswarden.service
@@ -979,6 +985,20 @@ Conceptual definitions. Implementers must keep these names and field meanings. T
 - **Command execution restrictions** — No shell interpolation. External tools (if ever used as fallback) are invoked with explicit argument vectors, never through a shell, never with config-derived strings as code.
 - **No network policy** — syswarden opens no network sockets and makes no outbound connections. This is an invariant; the daemon links no networking crates. The invariant targets *networking* only. Two local `AF_UNIX` uses are explicitly permitted and are **not** "network": (1) systemd D-Bus for read/write of unit properties, and (2) the systemd readiness/watchdog protocol via `$NOTIFY_SOCKET` (`sd_notify`: `READY=1`, `WATCHDOG=1`). The watchdog datagram is sent with `std` (`UnixDatagram`) only — no `libsystemd`, no networking crate. The unit's `RestrictAddressFamilies=AF_UNIX` and `IPAddressDeny=any` enforce this boundary at the kernel level.
 - **No shell injection policy** — Config values are data, never executed. There is no "run this command" config field.
+
+### 17.1 Activation-time first cleanup (operator tooling, NOT the daemon)
+
+The hard invariants above ("No destructive defaults", "never kill processes / drop caches") govern **the daemon**. They remain absolute: `syswarden` the binary never kills a process and never drops caches.
+
+The owner-approved profile *activation scripts* (`scripts/profiles/activate-<profile>.sh`, §14) are operator tooling run by a human at install time, outside the daemon and outside `safety::evaluate`. To satisfy the "do a first general memory/process cleanup on activation" requirement, they may perform a one-time destructive reclaim under **all** of the following bounds — and only these:
+
+- **Human-confirmed.** The cleanup never runs unattended. It prints exactly what it will do, requires an interactive `[y/N]` confirmation (default *No*), and prints the candidate process list for a second confirmation before sending any signal. A non-interactive shell skips the cleanup unless `SYSWARDEN_ASSUME_YES=1` is set explicitly.
+- **Cannot take the system (or itself) down.** A never-kill set is computed and excluded: PID 1, kernel threads (no `/proc/<pid>/exe`), all system/root processes (`uid < 1000`), `syswarden`, `sshd`, the script's own process tree, the invoking user's login-session tree, the user's entire `systemd --user` session, and a session/desktop-critical comm denylist (compositors, display managers, audio, dbus).
+- **Memory reclaim** is limited to `sync` + `/proc/sys/vm/drop_caches` + `/proc/sys/vm/compact_memory`.
+- **Process reclaim** sends **SIGTERM only** (graceful) — never SIGKILL — to heavy (`rss >= SYSWARDEN_CLEAN_RSS_MB`, default 300 MB) **user** processes that survive the never-kill filter.
+- **Never for `conservative`.** The conservative profile promises zero system touch; its activation script skips the cleanup entirely.
+
+This carve-out is intentionally confined to operator-run activation scripts. No code path in the daemon, policy, or actions layer gains kill/drop-cache capability.
 
 ---
 
