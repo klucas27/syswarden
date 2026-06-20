@@ -358,6 +358,7 @@ mod tests {
             memory_current: 0,
             restarts: 0,
             flags,
+            matched_rules: Vec::new(),
         }
     }
 

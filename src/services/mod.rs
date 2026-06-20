@@ -1,10 +1,14 @@
-//! Read-only systemd service analysis and flagging (architecture.md §5.7).
+//! Read-only systemd service analysis and flagging (architecture.md §5.7, Phase 32).
+//!
+//! Phase 32 adds `evaluate_resource_rules` — a deterministic, pure function that matches
+//! `service_rules` against a service and produces flags + matched rules without touching the
+//! system. Protected and non-allowlisted services never receive resource-control flags.
 #![allow(dead_code)]
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ServiceRule};
 use crate::error::SyswardenError;
 
-/// Why a service was flagged (architecture.md §5.7).
+/// Why a service was flagged (architecture.md §5.7, Phase 32).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceFlag {
     /// `active_state == "failed"`.
@@ -13,8 +17,12 @@ pub enum ServiceFlag {
     Restarting,
     /// `memory_current` exceeds a matching service rule's `memory_high_mb`.
     HighMemory,
-    /// Any rule-based threshold (currently `HighMemory`) was exceeded.
+    /// Any rule-based threshold (`HighMemory`) was exceeded.
     RuleViolation,
+    /// A service rule specifies a `cpu_weight` for this service (Phase 32).
+    CpuWeightRule,
+    /// A service rule specifies an `io_weight` for this service (Phase 32).
+    IoWeightRule,
 }
 
 /// Per-service snapshot for one collection tick (architecture.md §15).
@@ -23,6 +31,8 @@ pub enum ServiceFlag {
 /// `memory_current` is `MemoryCurrent` in bytes; systemd returns `u64::MAX` when
 /// memory accounting is disabled for the unit — callers must treat that as "unknown".
 /// `restarts` is `NRestarts` from the `org.freedesktop.systemd1.Service` interface.
+/// `matched_rules` carries the rules that matched this service (Phase 32), forwarded to the
+/// planner so it can build `params["cpu_weight"]` / `params["persistent"]` correctly.
 #[derive(Debug, Clone)]
 pub struct ServiceInfo {
     pub unit: String,
@@ -34,6 +44,8 @@ pub struct ServiceInfo {
     pub memory_current: u64,
     pub restarts: u32,
     pub flags: Vec<ServiceFlag>,
+    /// Service rules that matched this unit (empty when protected or not in allowed list).
+    pub matched_rules: Vec<ServiceRule>,
 }
 
 fn is_service_protected(unit: &str, config: &AppConfig) -> bool {
@@ -44,26 +56,64 @@ fn is_service_allowed(unit: &str, config: &AppConfig) -> bool {
     config.allowed.services.iter().any(|s| s == unit)
 }
 
-fn compute_flags(info: &ServiceInfo, config: &AppConfig) -> Vec<ServiceFlag> {
-    let mut high_mem = false;
-    // u64::MAX means accounting disabled — treat as 0 to avoid false positives.
-    let safe_mem = if info.memory_current == u64::MAX {
-        0
+/// Evaluate `rules` against a service and return `(flags, matched_rules)`.
+///
+/// This is the **deterministic core** of the Phase 32 rule engine (architecture.md §5.7).
+/// It never touches the system — all inputs are plain values, making it trivially testable.
+///
+/// Invariants (architecture.md §17 / Phase 32 acceptance):
+/// - Protected services (`is_protected = true`) receive no resource-control flags.
+/// - Non-allowlisted services (`is_allowed = false`) receive no resource-control flags.
+/// - `Failing` and `Restarting` are state flags set by `compute_flags`, not here.
+/// - `u64::MAX` for `memory_current` means accounting is disabled → treated as 0.
+#[must_use]
+pub fn evaluate_resource_rules(
+    unit: &str,
+    is_protected: bool,
+    is_allowed: bool,
+    memory_current: u64,
+    rules: &[ServiceRule],
+) -> (Vec<ServiceFlag>, Vec<ServiceRule>) {
+    // Safety gate: never flag protected or non-allowlisted services for resource control.
+    if is_protected || !is_allowed {
+        return (Vec::new(), Vec::new());
+    }
+
+    // u64::MAX = memory accounting disabled; avoid false positives.
+    let safe_mem_bytes = if memory_current == u64::MAX {
+        0u64
     } else {
-        info.memory_current
+        memory_current
     };
 
-    for rule in &config.service_rules {
-        if !info.unit.contains(rule.name_match.as_str()) {
+    let mut flags: Vec<ServiceFlag> = Vec::new();
+    let mut matched: Vec<ServiceRule> = Vec::new();
+
+    for rule in rules {
+        if !unit.contains(rule.name_match.as_str()) {
             continue;
         }
+        matched.push(rule.clone());
+
+        if rule.cpu_weight.is_some() && !flags.contains(&ServiceFlag::CpuWeightRule) {
+            flags.push(ServiceFlag::CpuWeightRule);
+        }
+        if rule.io_weight.is_some() && !flags.contains(&ServiceFlag::IoWeightRule) {
+            flags.push(ServiceFlag::IoWeightRule);
+        }
         if let Some(limit_mb) = rule.memory_high_mb {
-            if safe_mem / (1024 * 1024) > limit_mb {
-                high_mem = true;
+            let current_mb = safe_mem_bytes / (1024 * 1024);
+            if current_mb > limit_mb && !flags.contains(&ServiceFlag::HighMemory) {
+                flags.push(ServiceFlag::HighMemory);
+                flags.push(ServiceFlag::RuleViolation);
             }
         }
     }
 
+    (flags, matched)
+}
+
+fn compute_flags(info: &ServiceInfo, config: &AppConfig) -> (Vec<ServiceFlag>, Vec<ServiceRule>) {
     let mut flags = Vec::new();
     if info.active_state == "failed" {
         flags.push(ServiceFlag::Failing);
@@ -71,11 +121,15 @@ fn compute_flags(info: &ServiceInfo, config: &AppConfig) -> Vec<ServiceFlag> {
     if info.sub_state == "auto-restart" {
         flags.push(ServiceFlag::Restarting);
     }
-    if high_mem {
-        flags.push(ServiceFlag::HighMemory);
-        flags.push(ServiceFlag::RuleViolation);
-    }
-    flags
+    let (resource_flags, matched) = evaluate_resource_rules(
+        &info.unit,
+        info.is_protected,
+        info.is_allowed,
+        info.memory_current,
+        &config.service_rules,
+    );
+    flags.extend(resource_flags);
+    (flags, matched)
 }
 
 // D-Bus tuple from org.freedesktop.systemd1.Manager.ListUnits:
@@ -177,8 +231,11 @@ fn query_systemd(config: &AppConfig) -> Result<Vec<ServiceInfo>, SyswardenError>
             memory_current,
             restarts,
             flags: Vec::new(),
+            matched_rules: Vec::new(),
         };
-        info.flags = compute_flags(&info, config);
+        let (flags, matched) = compute_flags(&info, config);
+        info.flags = flags;
+        info.matched_rules = matched;
         result.push(info);
     }
 
@@ -205,25 +262,48 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, ServiceRule};
 
+    // ---- helpers ----
+
     fn make_info(unit: &str, active: &str, sub: &str, mem_bytes: u64) -> ServiceInfo {
         ServiceInfo {
             unit: unit.to_string(),
             active_state: active.to_string(),
             sub_state: sub.to_string(),
             is_protected: false,
-            is_allowed: false,
+            is_allowed: true, // allowed by default in tests so resource flags can fire
             cpu_usage: 0,
             memory_current: mem_bytes,
             restarts: 0,
             flags: Vec::new(),
+            matched_rules: Vec::new(),
         }
     }
+
+    fn mem_rule(name: &str, mb: u64) -> ServiceRule {
+        ServiceRule {
+            name_match: name.to_string(),
+            cpu_weight: None,
+            io_weight: None,
+            memory_high_mb: Some(mb),
+        }
+    }
+
+    fn full_rule(name: &str, cpu: u32, io: u32, mem_mb: u64) -> ServiceRule {
+        ServiceRule {
+            name_match: name.to_string(),
+            cpu_weight: Some(cpu),
+            io_weight: Some(io),
+            memory_high_mb: Some(mem_mb),
+        }
+    }
+
+    // ---- compute_flags: state flags (failing/restarting) ----
 
     #[test]
     fn compute_flags_failing_service() {
         let cfg = AppConfig::default();
         let info = make_info("foo.service", "failed", "failed", 0);
-        let flags = compute_flags(&info, &cfg);
+        let (flags, _) = compute_flags(&info, &cfg);
         assert!(flags.contains(&ServiceFlag::Failing));
         assert!(!flags.contains(&ServiceFlag::RuleViolation));
     }
@@ -232,62 +312,160 @@ mod tests {
     fn compute_flags_restarting_service() {
         let cfg = AppConfig::default();
         let info = make_info("foo.service", "activating", "auto-restart", 0);
-        let flags = compute_flags(&info, &cfg);
+        let (flags, _) = compute_flags(&info, &cfg);
         assert!(flags.contains(&ServiceFlag::Restarting));
         assert!(!flags.contains(&ServiceFlag::Failing));
     }
 
+    // ---- Phase 32: evaluate_resource_rules decision table ----
+
     #[test]
-    fn compute_flags_high_memory_rule_violation() {
-        let mut cfg = AppConfig::default();
-        cfg.service_rules.push(ServiceRule {
-            name_match: "nightly-build.service".to_string(),
-            cpu_weight: None,
-            io_weight: None,
-            memory_high_mb: Some(4096),
-        });
+    fn resource_rules_high_memory_violation() {
+        let rules = [mem_rule("nightly-build.service", 4096)];
         // 5 GiB > 4096 MiB
-        let info = make_info(
+        let (flags, matched) = evaluate_resource_rules(
             "nightly-build.service",
-            "active",
-            "running",
+            false,
+            true,
             5 * 1024 * 1024 * 1024,
+            &rules,
         );
-        let flags = compute_flags(&info, &cfg);
         assert!(flags.contains(&ServiceFlag::HighMemory));
         assert!(flags.contains(&ServiceFlag::RuleViolation));
         assert!(!flags.contains(&ServiceFlag::Failing));
+        assert_eq!(matched.len(), 1);
     }
 
     #[test]
-    fn compute_flags_empty_within_limits() {
-        let mut cfg = AppConfig::default();
-        cfg.service_rules.push(ServiceRule {
-            name_match: "myapp.service".to_string(),
-            cpu_weight: None,
-            io_weight: None,
-            memory_high_mb: Some(4096),
-        });
-        // 1 GiB < 4096 MiB — within limits
-        let info = make_info("myapp.service", "active", "running", 1024 * 1024 * 1024);
-        let flags = compute_flags(&info, &cfg);
+    fn resource_rules_within_memory_limit_no_flags() {
+        let rules = [mem_rule("myapp.service", 4096)];
+        let (flags, _) = evaluate_resource_rules(
+            "myapp.service",
+            false,
+            true,
+            1024 * 1024 * 1024, // 1 GiB < 4096 MiB
+            &rules,
+        );
         assert!(flags.is_empty());
     }
 
     #[test]
-    fn compute_flags_memory_max_unavailable_not_flagged() {
-        let mut cfg = AppConfig::default();
-        cfg.service_rules.push(ServiceRule {
-            name_match: "myapp.service".to_string(),
-            cpu_weight: None,
-            io_weight: None,
-            memory_high_mb: Some(100),
-        });
-        // u64::MAX = accounting disabled — must NOT trigger HighMemory
-        let info = make_info("myapp.service", "active", "running", u64::MAX);
-        let flags = compute_flags(&info, &cfg);
+    fn resource_rules_memory_accounting_disabled_not_flagged() {
+        let rules = [mem_rule("myapp.service", 100)];
+        let (flags, _) = evaluate_resource_rules("myapp.service", false, true, u64::MAX, &rules);
         assert!(!flags.contains(&ServiceFlag::HighMemory));
     }
+
+    #[test]
+    fn resource_rules_cpu_weight_rule_sets_flag() {
+        let rules = [ServiceRule {
+            name_match: "heavy.service".to_string(),
+            cpu_weight: Some(50),
+            io_weight: None,
+            memory_high_mb: None,
+        }];
+        let (flags, matched) = evaluate_resource_rules("heavy.service", false, true, 0, &rules);
+        assert!(flags.contains(&ServiceFlag::CpuWeightRule));
+        assert!(!flags.contains(&ServiceFlag::IoWeightRule));
+        assert_eq!(matched[0].cpu_weight, Some(50));
+    }
+
+    #[test]
+    fn resource_rules_io_weight_rule_sets_flag() {
+        let rules = [ServiceRule {
+            name_match: "iobound.service".to_string(),
+            cpu_weight: None,
+            io_weight: Some(25),
+            memory_high_mb: None,
+        }];
+        let (flags, _) = evaluate_resource_rules("iobound.service", false, true, 0, &rules);
+        assert!(flags.contains(&ServiceFlag::IoWeightRule));
+        assert!(!flags.contains(&ServiceFlag::CpuWeightRule));
+    }
+
+    #[test]
+    fn resource_rules_all_three_flags_from_full_rule() {
+        let rules = [full_rule("nightly.service", 50, 25, 2048)];
+        let (flags, matched) = evaluate_resource_rules(
+            "nightly.service",
+            false,
+            true,
+            3 * 1024 * 1024 * 1024, // 3 GiB > 2048 MiB
+            &rules,
+        );
+        assert!(flags.contains(&ServiceFlag::CpuWeightRule));
+        assert!(flags.contains(&ServiceFlag::IoWeightRule));
+        assert!(flags.contains(&ServiceFlag::HighMemory));
+        assert!(flags.contains(&ServiceFlag::RuleViolation));
+        assert_eq!(matched.len(), 1);
+    }
+
+    // ---- Phase 32 invariant: protected untouched ----
+
+    #[test]
+    fn resource_rules_protected_service_gets_no_resource_flags() {
+        let rules = [full_rule("protected.service", 50, 25, 100)];
+        let (flags, matched) = evaluate_resource_rules(
+            "protected.service",
+            true, // is_protected
+            true,
+            200 * 1024 * 1024, // over 100 MiB limit
+            &rules,
+        );
+        assert!(
+            flags.is_empty(),
+            "protected service must not get resource flags"
+        );
+        assert!(matched.is_empty());
+    }
+
+    // ---- Phase 32 invariant: non-allowlisted untouched ----
+
+    #[test]
+    fn resource_rules_non_allowed_service_gets_no_resource_flags() {
+        let rules = [full_rule("stranger.service", 50, 25, 100)];
+        let (flags, matched) = evaluate_resource_rules(
+            "stranger.service",
+            false,
+            false, // is_allowed = false
+            200 * 1024 * 1024,
+            &rules,
+        );
+        assert!(
+            flags.is_empty(),
+            "non-allowed service must not get resource flags"
+        );
+        assert!(matched.is_empty());
+    }
+
+    // ---- Phase 32: substring matching ----
+
+    #[test]
+    fn resource_rules_no_match_gives_empty() {
+        let rules = [mem_rule("specific.service", 100)];
+        let (flags, matched) =
+            evaluate_resource_rules("other.service", false, true, 200 * 1024 * 1024, &rules);
+        assert!(flags.is_empty());
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn resource_rules_multiple_rules_matched_returns_all() {
+        let rules = [
+            mem_rule("myapp.service", 1024),
+            ServiceRule {
+                name_match: "myapp".to_string(), // substring match
+                cpu_weight: Some(50),
+                io_weight: None,
+                memory_high_mb: None,
+            },
+        ];
+        let (flags, matched) = evaluate_resource_rules("myapp.service", false, true, 0, &rules);
+        assert!(flags.contains(&ServiceFlag::CpuWeightRule));
+        assert_eq!(matched.len(), 2);
+    }
+
+    // ---- pre-existing: protected/allowed helpers ----
 
     #[test]
     fn is_protected_matches_default_set() {
@@ -315,8 +493,6 @@ mod tests {
 
     #[test]
     fn analyze_does_not_panic_without_systemd() {
-        // Verifies the degradation contract: analyze must never panic regardless of
-        // whether D-Bus / systemd is available in the test environment.
         let cfg = AppConfig::default();
         let _services = analyze(&cfg);
     }
