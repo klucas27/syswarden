@@ -28,7 +28,10 @@ const SYSTEMD_BUS: &str = "org.freedesktop.systemd1";
 const MANAGER_PATH: &str = "/org/freedesktop/systemd1";
 const MANAGER_IFACE: &str = "org.freedesktop.systemd1.Manager";
 const SERVICE_IFACE: &str = "org.freedesktop.systemd1.Service";
+const UNIT_IFACE: &str = "org.freedesktop.systemd1.Unit";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
+
+const PROP_ACTIVE_STATE: &str = "ActiveState";
 
 const PROP_CPU_WEIGHT: &str = "CPUWeight";
 const PROP_IO_WEIGHT: &str = "IOWeight";
@@ -216,6 +219,63 @@ pub fn daemon_reload() -> Result<()> {
     manager
         .call::<_, _, ()>("Reload", &())
         .context("systemd: Manager.Reload failed")?;
+    Ok(())
+}
+
+/// Read the `ActiveState` property for `unit` from the systemd D-Bus (Phase 34).
+///
+/// Returns the raw string value (e.g. `"active"`, `"inactive"`, `"failed"`).
+/// Used to capture prior state before `RestartUnit` / `StopUnit`.
+///
+/// # Errors
+/// System D-Bus unavailable; unit not loaded; `ActiveState` property absent.
+pub fn get_active_state(unit: &str) -> Result<String> {
+    let conn = Connection::system().context("systemd: connect to system D-Bus")?;
+    let path = resolve_unit_path(&conn, unit)?;
+    let proxy = zbus::blocking::Proxy::new(&conn, SYSTEMD_BUS, path.as_str(), PROPS_IFACE)
+        .context("systemd: create properties proxy")?;
+    let all: HashMap<String, OwnedValue> = proxy
+        .call("GetAll", &(UNIT_IFACE,))
+        .context("systemd: GetAll(Unit) failed")?;
+    all.get(PROP_ACTIVE_STATE)
+        .and_then(|v| {
+            if let Value::Str(s) = &**v {
+                Some(s.to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("systemd: ActiveState not found for {unit}"))
+}
+
+/// Issue `Manager.RestartUnit(unit, "replace")` via the system D-Bus (Phase 34).
+///
+/// Uses `"replace"` mode: if a pending job exists it is replaced rather than
+/// queued in addition. No shell, no arg interpolation.
+///
+/// # Errors
+/// System D-Bus unavailable; `RestartUnit` call rejected by systemd.
+pub fn restart_unit(unit: &str) -> Result<()> {
+    let conn = Connection::system().context("systemd: connect to system D-Bus")?;
+    let manager = zbus::blocking::Proxy::new(&conn, SYSTEMD_BUS, MANAGER_PATH, MANAGER_IFACE)
+        .context("systemd: create manager proxy")?;
+    let _job: OwnedObjectPath = manager
+        .call("RestartUnit", &(unit, "replace"))
+        .context("systemd: RestartUnit failed")?;
+    Ok(())
+}
+
+/// Issue `Manager.StopUnit(unit, "replace")` via the system D-Bus (Phase 34).
+///
+/// # Errors
+/// System D-Bus unavailable; `StopUnit` call rejected by systemd.
+pub fn stop_unit(unit: &str) -> Result<()> {
+    let conn = Connection::system().context("systemd: connect to system D-Bus")?;
+    let manager = zbus::blocking::Proxy::new(&conn, SYSTEMD_BUS, MANAGER_PATH, MANAGER_IFACE)
+        .context("systemd: create manager proxy")?;
+    let _job: OwnedObjectPath = manager
+        .call("StopUnit", &(unit, "replace"))
+        .context("systemd: StopUnit failed")?;
     Ok(())
 }
 

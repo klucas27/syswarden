@@ -170,6 +170,7 @@ impl RollbackStore {
         match entry.action_kind.as_str() {
             "AdjustNice" => revert_nice(&entry.prior_state),
             "AdjustIonice" => revert_ionice(&entry.prior_state),
+            "StopService" => revert_stop_service(&entry.prior_state, &entry.target),
             "SetCpuWeight" | "SetIoWeight" | "SetMemoryHigh" | "SetMemoryMax" => {
                 if entry.prior_state.get("backend").and_then(|v| v.as_str()) == Some("persistent") {
                     revert_drop_in(&entry.prior_state)
@@ -322,6 +323,24 @@ fn revert_service_props(unit: &str, prior_state: &serde_json::Value) -> Result<(
     }
     crate::systemd::set_unit_properties(unit, &prior, true)
         .with_context(|| format!("rollback: restore properties for {unit}"))?;
+    Ok(())
+}
+
+/// Revert a `StopService` action (Phase 34): restart the unit if it was active before stop.
+///
+/// If `prior_state["active_state"]` is `"active"` or `"activating"`, issues
+/// `Manager.RestartUnit` via D-Bus. Otherwise the unit was already not running — nothing to do.
+///
+/// # Errors
+/// Missing `active_state` field; D-Bus unavailable; unit not found.
+fn revert_stop_service(prior_state: &serde_json::Value, target: &str) -> Result<()> {
+    let prior_active = prior_state["active_state"].as_str().unwrap_or("inactive");
+    if prior_active == "active" || prior_active == "activating" {
+        let unit = parse_unit_from_target(target)
+            .ok_or_else(|| anyhow::anyhow!("rollback: cannot parse unit from target '{target}'"))?;
+        crate::systemd::restart_unit(&unit)
+            .with_context(|| format!("rollback: RestartUnit for {unit}"))?;
+    }
     Ok(())
 }
 
@@ -615,6 +634,64 @@ mod tests {
         assert!(
             !msg.contains("no revert handler"),
             "unexpected routing error: {msg}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Phase 34: StopService rollback routing ---
+
+    #[test]
+    fn rollback_apply_routes_stop_service_to_revert_stop() {
+        // revert_stop_service with prior active_state="inactive" → no D-Bus call → Ok.
+        let (mut store, dir) = temp_store("stop_service_inactive");
+        let prior_state = serde_json::json!({ "active_state": "inactive" });
+        let entry = RollbackEntry::new("StopService", "unit=test.service", true)
+            .with_prior_state(prior_state);
+        let id = entry.id;
+        store.record(entry);
+
+        // Prior state is "inactive" → nothing to restart → Ok() without D-Bus.
+        store
+            .apply(id)
+            .expect("revert of inactive service should be no-op");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_apply_stop_service_active_routes_to_dbus() {
+        // prior state "active" → tries RestartUnit → fails at D-Bus (no systemd in test).
+        let (mut store, dir) = temp_store("stop_service_active");
+        let prior_state = serde_json::json!({ "active_state": "active" });
+        let entry = RollbackEntry::new("StopService", "unit=test.service", true)
+            .with_prior_state(prior_state);
+        let id = entry.id;
+        store.record(entry);
+
+        let err = store.apply(id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("no revert handler"),
+            "expected D-Bus error not routing error, got: {msg}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_apply_restart_service_is_irreversible() {
+        // RestartService entries have reversible=false → apply returns irreversible error.
+        let (mut store, dir) = temp_store("restart_irreversible");
+        let entry = RollbackEntry::new("RestartService", "unit=test.service", false)
+            .with_prior_state(serde_json::json!({ "active_state": "active" }));
+        let id = entry.id;
+        store.record(entry);
+
+        let err = store.apply(id).unwrap_err();
+        assert!(
+            err.to_string().contains("irreversible"),
+            "expected irreversible error, got: {err}"
         );
 
         let _ = fs::remove_dir_all(&dir);

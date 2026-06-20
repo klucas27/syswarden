@@ -907,6 +907,93 @@ fn dispatch_with_prior(
             };
             Ok((result, prior_json, true))
         }
+        ActionKind::RestartService => {
+            let unit = get_service_unit(action)?;
+            // Defense-in-depth re-checks (architecture.md §17.3).
+            if !config.allowed.services.contains(&unit) {
+                return Ok((
+                    ActionResult {
+                        action_id: action.id,
+                        status: ActionStatus::Blocked,
+                        message: format!("{unit} not in allowed.services"),
+                        rollback_id: None,
+                    },
+                    serde_json::Value::Null,
+                    false,
+                ));
+            }
+            if config.protected.services.contains(&unit) {
+                return Ok((
+                    ActionResult {
+                        action_id: action.id,
+                        status: ActionStatus::Blocked,
+                        message: format!("{unit} is in protected.services"),
+                        rollback_id: None,
+                    },
+                    serde_json::Value::Null,
+                    false,
+                ));
+            }
+            // Capture prior active-state before restarting.
+            let prior_active = systemd::get_active_state(&unit)
+                .with_context(|| format!("RestartService: get_active_state for {unit}"))?;
+            systemd::restart_unit(&unit).with_context(|| format!("RestartUnit for {unit}"))?;
+            let prior_json = serde_json::json!({ "active_state": prior_active });
+            // Restart is not meaningfully reversible — service is running either way.
+            Ok((
+                ActionResult {
+                    action_id: action.id,
+                    status: ActionStatus::Executed,
+                    message: format!("restarted {unit}"),
+                    rollback_id: None,
+                },
+                prior_json,
+                false,
+            ))
+        }
+        ActionKind::StopService => {
+            let unit = get_service_unit(action)?;
+            // Defense-in-depth re-checks (architecture.md §17.3).
+            if !config.allowed.services.contains(&unit) {
+                return Ok((
+                    ActionResult {
+                        action_id: action.id,
+                        status: ActionStatus::Blocked,
+                        message: format!("{unit} not in allowed.services"),
+                        rollback_id: None,
+                    },
+                    serde_json::Value::Null,
+                    false,
+                ));
+            }
+            if config.protected.services.contains(&unit) {
+                return Ok((
+                    ActionResult {
+                        action_id: action.id,
+                        status: ActionStatus::Blocked,
+                        message: format!("{unit} is in protected.services"),
+                        rollback_id: None,
+                    },
+                    serde_json::Value::Null,
+                    false,
+                ));
+            }
+            // Capture prior active-state for rollback (revert = restart if was active).
+            let prior_active = systemd::get_active_state(&unit)
+                .with_context(|| format!("StopService: get_active_state for {unit}"))?;
+            systemd::stop_unit(&unit).with_context(|| format!("StopUnit for {unit}"))?;
+            let prior_json = serde_json::json!({ "active_state": prior_active });
+            Ok((
+                ActionResult {
+                    action_id: action.id,
+                    status: ActionStatus::Executed,
+                    message: format!("stopped {unit}"),
+                    rollback_id: None,
+                },
+                prior_json,
+                true,
+            ))
+        }
         // Informational / safe actions — execute as no-ops, no rollback needed.
         _ => {
             let result = ActionResult {
@@ -1736,5 +1823,84 @@ mod tests {
             explanation: "test".into(),
         };
         assert!(build_unit_props_for_action(&action).is_err());
+    }
+
+    // --- Phase 34: RestartService / StopService dispatch defense ---
+
+    #[test]
+    fn dispatch_restart_blocks_unlisted_service() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::RestartService,
+            risk: ActionRisk::Aggressive,
+            target: ActionTarget::Service {
+                unit: "unlisted.service".into(),
+            },
+            params: HashMap::new(),
+            explanation: "test".into(),
+        };
+        let (result, _, reversible) = dispatch_with_prior(&action, &AppConfig::default()).unwrap();
+        assert_eq!(result.status, ActionStatus::Blocked);
+        assert!(!reversible);
+        assert!(result.message.contains("not in allowed.services"));
+    }
+
+    #[test]
+    fn dispatch_stop_blocks_unlisted_service() {
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::StopService,
+            risk: ActionRisk::Aggressive,
+            target: ActionTarget::Service {
+                unit: "unlisted.service".into(),
+            },
+            params: HashMap::new(),
+            explanation: "test".into(),
+        };
+        let (result, _, reversible) = dispatch_with_prior(&action, &AppConfig::default()).unwrap();
+        assert_eq!(result.status, ActionStatus::Blocked);
+        assert!(!reversible);
+    }
+
+    #[test]
+    fn dispatch_restart_blocks_protected_service() {
+        let mut config = open_config("syswarden.service");
+        // syswarden.service is in protected.services by default.
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::RestartService,
+            risk: ActionRisk::Aggressive,
+            target: ActionTarget::Service {
+                unit: "syswarden.service".into(),
+            },
+            params: HashMap::new(),
+            explanation: "test".into(),
+        };
+        // Make sure it's allowed but still protected.
+        config.allowed.services.push("syswarden.service".into());
+        let (result, _, reversible) = dispatch_with_prior(&action, &config).unwrap();
+        assert_eq!(result.status, ActionStatus::Blocked);
+        assert!(!reversible);
+        assert!(result.message.contains("protected.services"));
+    }
+
+    #[test]
+    fn dispatch_stop_blocks_protected_service() {
+        let mut config = open_config("sshd.service");
+        config.allowed.services.push("sshd.service".into());
+        let action = PlannedAction {
+            id: 1,
+            kind: ActionKind::StopService,
+            risk: ActionRisk::Aggressive,
+            target: ActionTarget::Service {
+                unit: "sshd.service".into(),
+            },
+            params: HashMap::new(),
+            explanation: "test".into(),
+        };
+        let (result, _, reversible) = dispatch_with_prior(&action, &config).unwrap();
+        assert_eq!(result.status, ActionStatus::Blocked);
+        assert!(!reversible);
+        assert!(result.message.contains("protected.services"));
     }
 }
