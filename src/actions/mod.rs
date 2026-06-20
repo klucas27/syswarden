@@ -16,6 +16,7 @@ use crate::processes::ProcessInfo;
 use crate::profiles::{ActionRisk, ProfileConfig};
 use crate::rollback::{RollbackEntry, RollbackStore};
 use crate::safety::{self, Capabilities, SafetyDecision};
+use crate::sysctl;
 use crate::systemd::{self, UnitProps};
 
 // ---------------------------------------------------------------------------
@@ -988,6 +989,35 @@ fn dispatch_with_prior(
                     action_id: action.id,
                     status: ActionStatus::Executed,
                     message: format!("stopped {unit}"),
+                    rollback_id: None,
+                },
+                prior_json,
+                true,
+            ))
+        }
+        ActionKind::ApplySysctl => {
+            let key = action
+                .params
+                .get("key")
+                .ok_or_else(|| anyhow::anyhow!("ApplySysctl: missing 'key' param"))?
+                .clone();
+            let value = action
+                .params
+                .get("value")
+                .ok_or_else(|| anyhow::anyhow!("ApplySysctl: missing 'value' param"))?
+                .clone();
+            let prior = sysctl::apply(&key, &value)
+                .with_context(|| format!("ApplySysctl: {key}={value}"))?;
+            let prior_json = serde_json::json!({
+                "key": prior.key,
+                "prior_value": prior.prior_value,
+                "applied_value": prior.applied_value,
+            });
+            Ok((
+                ActionResult {
+                    action_id: action.id,
+                    status: ActionStatus::Executed,
+                    message: format!("set sysctl {key}={value} (was {})", prior.prior_value),
                     rollback_id: None,
                 },
                 prior_json,

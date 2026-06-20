@@ -18,5 +18,6 @@ pub mod reports;
 pub mod rollback;
 pub mod safety;
 pub mod services;
+pub mod sysctl;
 pub mod systemd;
 pub mod zram;

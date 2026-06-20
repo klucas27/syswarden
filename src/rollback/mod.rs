@@ -185,6 +185,7 @@ impl RollbackStore {
                     revert_service_props(&unit, &entry.prior_state)
                 }
             }
+            "ApplySysctl" => revert_sysctl(&entry.prior_state),
             kind => bail!("rollback: no revert handler for action_kind '{kind}'"),
         }
     }
@@ -341,6 +342,25 @@ fn revert_stop_service(prior_state: &serde_json::Value, target: &str) -> Result<
         crate::systemd::restart_unit(&unit)
             .with_context(|| format!("rollback: RestartUnit for {unit}"))?;
     }
+    Ok(())
+}
+
+/// Revert an `ApplySysctl` action (Phase 35): restore the prior kernel tunable value.
+///
+/// Reads `key` and `prior_value` from `prior_state` and calls `sysctl::apply`
+/// to write the original value back, including verify-read.
+///
+/// # Errors
+/// Missing fields; sysctl path unwritable; write verification fails.
+fn revert_sysctl(prior_state: &serde_json::Value) -> Result<()> {
+    let key = prior_state["key"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("rollback: sysctl prior_state missing 'key'"))?;
+    let prior_value = prior_state["prior_value"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("rollback: sysctl prior_state missing 'prior_value'"))?;
+    crate::sysctl::apply(key, prior_value)
+        .with_context(|| format!("rollback: restore sysctl {key}={prior_value}"))?;
     Ok(())
 }
 
